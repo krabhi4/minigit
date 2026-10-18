@@ -434,3 +434,194 @@ func TestThreeWayMergeAndConflicts(t *testing.T) {
 		t.Fatalf("expected conflict markers in shared.txt: %s", content)
 	}
 }
+
+func TestChunkLevelThreeWayMergeIntegration(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-chunk-integ-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	binPath, err := filepath.Abs("../minigit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCmd(t, tempDir, binPath, "init")
+
+	serviceFile := filepath.Join(tempDir, "service.go")
+	initialCode := "package main\n\nfunc start() {\n\tprintln(\"init\")\n}\n\nfunc worker() {\n\tprintln(\"work\")\n}\n\nfunc stop() {\n\tprintln(\"cleanup\")\n}\n"
+	if err := os.WriteFile(serviceFile, []byte(initialCode), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "service.go")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Initial service")
+
+	runCmd(t, tempDir, binPath, "branch", "side-branch")
+
+	mainCode := "package main\n\nfunc start() {\n\tprintln(\"started\")\n\tprintln(\"init\")\n}\n\nfunc worker() {\n\tprintln(\"work\")\n}\n\nfunc stop() {\n\tprintln(\"cleanup\")\n}\n"
+	if err := os.WriteFile(serviceFile, []byte(mainCode), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "service.go")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Modify start on main")
+
+	runCmd(t, tempDir, binPath, "checkout", "side-branch")
+	sideCode := "package main\n\nfunc start() {\n\tprintln(\"init\")\n}\n\nfunc worker() {\n\tprintln(\"work\")\n}\n\nfunc stop() {\n\tprintln(\"stopped\")\n\tprintln(\"cleanup\")\n}\n"
+	if err := os.WriteFile(serviceFile, []byte(sideCode), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "service.go")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Modify stop on side-branch")
+
+	runCmd(t, tempDir, binPath, "checkout", "main")
+	mergeOut := runCmd(t, tempDir, binPath, "merge", "side-branch")
+	if !strings.Contains(mergeOut, "Merged side-branch into main") {
+		t.Fatalf("expected clean chunk merge: %s", mergeOut)
+	}
+
+	data, err := os.ReadFile(serviceFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "println(\"started\")") || !strings.Contains(content, "println(\"stopped\")") {
+		t.Fatalf("expected both edits in merged file: %s", content)
+	}
+	if strings.Contains(content, "<<<<<<<") || strings.Contains(content, ">>>>>>>") {
+		t.Fatalf("unexpected conflict markers in merged file: %s", content)
+	}
+
+	fsckOut := runCmd(t, tempDir, "git", "fsck", "--full")
+	if strings.Contains(fsckOut, "error") || strings.Contains(fsckOut, "fatal") || strings.Contains(fsckOut, "corrupt") {
+		t.Fatalf("git fsck reported corruption after chunk merge: %s", fsckOut)
+	}
+
+	statusOut := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(statusOut, "nothing to commit, working tree clean") {
+		t.Fatalf("expected clean status after merge: %s", statusOut)
+	}
+}
+
+func TestMultiStageConflictAndStatusIntegration(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-multistage-integ-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	binPath, err := filepath.Abs("../minigit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCmd(t, tempDir, binPath, "init")
+
+	sharedFile := filepath.Join(tempDir, "shared.txt")
+	baseText := "line 1\nline 2\nline 3\nline 4\nline 5\n"
+	if err := os.WriteFile(sharedFile, []byte(baseText), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "shared.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Base commit")
+
+	runCmd(t, tempDir, binPath, "branch", "other-branch")
+
+	mainText := "line 1\nline 2\nline 3 from main\nline 4\nline 5\n"
+	if err := os.WriteFile(sharedFile, []byte(mainText), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "shared.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Main edit")
+
+	runCmd(t, tempDir, binPath, "checkout", "other-branch")
+	otherText := "line 1\nline 2\nline 3 from other\nline 4\nline 5\n"
+	if err := os.WriteFile(sharedFile, []byte(otherText), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "shared.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Other edit")
+
+	runCmd(t, tempDir, binPath, "checkout", "main")
+
+	mergeCmd := exec.Command(binPath, "merge", "other-branch")
+	mergeCmd.Dir = tempDir
+	mergeOut, err := mergeCmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected merge conflict, got success: %s", string(mergeOut))
+	}
+
+	data, err := os.ReadFile(sharedFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "line 1\nline 2\n<<<<<<< HEAD\nline 3 from main\n=======\nline 3 from other\n>>>>>>> other-branch\nline 4\nline 5\n") {
+		t.Fatalf("unexpected content with conflict: %s", content)
+	}
+
+	lsFilesOut := runCmd(t, tempDir, "git", "ls-files", "--stage")
+	if !strings.Contains(lsFilesOut, " 1\tshared.txt") {
+		t.Fatalf("missing stage 1 in git ls-files: %s", lsFilesOut)
+	}
+	if !strings.Contains(lsFilesOut, " 2\tshared.txt") {
+		t.Fatalf("missing stage 2 in git ls-files: %s", lsFilesOut)
+	}
+	if !strings.Contains(lsFilesOut, " 3\tshared.txt") {
+		t.Fatalf("missing stage 3 in git ls-files: %s", lsFilesOut)
+	}
+	if strings.Contains(lsFilesOut, " 0\tshared.txt") {
+		t.Fatalf("stage 0 should not exist in conflict: %s", lsFilesOut)
+	}
+
+	statusOut := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(statusOut, "You have unmerged paths.") {
+		t.Fatalf("status missing unmerged paths notice: %s", statusOut)
+	}
+	if !strings.Contains(statusOut, "both modified:   shared.txt") {
+		t.Fatalf("status missing 'both modified: shared.txt': %s", statusOut)
+	}
+
+	commitCmd := exec.Command(binPath, "commit", "-m", "Premature commit")
+	commitCmd.Dir = tempDir
+	commitOut, err := commitCmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("commit should fail with unresolved conflict: %s", string(commitOut))
+	}
+
+	resolvedText := "line 1\nline 2\nline 3 merged\nline 4\nline 5\n"
+	if err := os.WriteFile(sharedFile, []byte(resolvedText), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runCmd(t, tempDir, binPath, "add", "shared.txt")
+
+	lsFilesResolved := runCmd(t, tempDir, "git", "ls-files", "--stage")
+	if strings.Contains(lsFilesResolved, " 1\tshared.txt") || strings.Contains(lsFilesResolved, " 2\tshared.txt") || strings.Contains(lsFilesResolved, " 3\tshared.txt") {
+		t.Fatalf("stages 1,2,3 should be cleared after add: %s", lsFilesResolved)
+	}
+	if !strings.Contains(lsFilesResolved, " 0\tshared.txt") {
+		t.Fatalf("stage 0 should be present after add: %s", lsFilesResolved)
+	}
+
+	statusResolved := runCmd(t, tempDir, binPath, "status")
+	if strings.Contains(statusResolved, "Unmerged paths") {
+		t.Fatalf("status should not show unmerged paths after resolution: %s", statusResolved)
+	}
+	if !strings.Contains(statusResolved, "modified:   shared.txt") {
+		t.Fatalf("status should show modified shared.txt staged: %s", statusResolved)
+	}
+
+	runCmd(t, tempDir, binPath, "commit", "-m", "Resolved merge conflict")
+
+	finalStatus := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(finalStatus, "nothing to commit, working tree clean") {
+		t.Fatalf("expected clean status after merge commit: %s", finalStatus)
+	}
+
+	fsckFinal := runCmd(t, tempDir, "git", "fsck", "--full")
+	if strings.Contains(fsckFinal, "error") || strings.Contains(fsckFinal, "fatal") || strings.Contains(fsckFinal, "corrupt") {
+		t.Fatalf("git fsck reported corruption after merge resolution: %s", fsckFinal)
+	}
+}
+

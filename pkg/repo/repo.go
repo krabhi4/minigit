@@ -607,9 +607,13 @@ func (r *Repository) FlattenTree(treeHash string, prefix string) (map[string]Fla
 type StatusType string
 
 const (
-	StatusAdded    StatusType = "new file"
-	StatusModified StatusType = "modified"
-	StatusDeleted  StatusType = "deleted"
+	StatusAdded         StatusType = "new file"
+	StatusModified      StatusType = "modified"
+	StatusDeleted       StatusType = "deleted"
+	StatusBothModified  StatusType = "both modified"
+	StatusBothAdded     StatusType = "both added"
+	StatusDeletedByThem StatusType = "deleted by them"
+	StatusDeletedByUs   StatusType = "deleted by us"
 )
 
 type FileStatus struct {
@@ -618,13 +622,14 @@ type FileStatus struct {
 }
 
 type RepoStatus struct {
-	Branch        string
-	IsDetached    bool
-	HEADHash      string
-	Staged        []FileStatus
-	Unstaged      []FileStatus
-	Untracked     []string
-	Clean         bool
+	Branch     string
+	IsDetached bool
+	HEADHash   string
+	Staged     []FileStatus
+	Unstaged   []FileStatus
+	Untracked  []string
+	Unmerged   []FileStatus
+	Clean      bool
 }
 
 func (r *Repository) Status() (*RepoStatus, error) {
@@ -655,9 +660,41 @@ func (r *Repository) Status() (*RepoStatus, error) {
 		return nil, err
 	}
 
-	indexFiles := make(map[string]index.IndexEntry)
+	stagesByPath := make(map[string]map[int]index.IndexEntry)
 	for _, entry := range idx.Entries {
-		indexFiles[entry.Path] = entry
+		st := entry.Stage()
+		if stagesByPath[entry.Path] == nil {
+			stagesByPath[entry.Path] = make(map[int]index.IndexEntry)
+		}
+		stagesByPath[entry.Path][st] = entry
+	}
+
+	indexFiles := make(map[string]index.IndexEntry)
+	unmergedPaths := make(map[string]bool)
+
+	for p, stages := range stagesByPath {
+		has1 := stages[1].Path != ""
+		has2 := stages[2].Path != ""
+		has3 := stages[3].Path != ""
+
+		if has1 || has2 || has3 {
+			unmergedPaths[p] = true
+			var stType StatusType
+			if has1 && has2 && has3 {
+				stType = StatusBothModified
+			} else if !has1 && has2 && has3 {
+				stType = StatusBothAdded
+			} else if has1 && has2 && !has3 {
+				stType = StatusDeletedByThem
+			} else if has1 && !has2 && has3 {
+				stType = StatusDeletedByUs
+			} else {
+				stType = StatusBothModified
+			}
+			res.Unmerged = append(res.Unmerged, FileStatus{Path: p, Status: stType})
+		} else if e, ok := stages[0]; ok {
+			indexFiles[p] = e
+		}
 	}
 
 	for p, idxEntry := range indexFiles {
@@ -670,6 +707,9 @@ func (r *Repository) Status() (*RepoStatus, error) {
 		}
 	}
 	for p := range headFiles {
+		if unmergedPaths[p] {
+			continue
+		}
 		if _, inIndex := indexFiles[p]; !inIndex {
 			res.Staged = append(res.Staged, FileStatus{Path: p, Status: StatusDeleted})
 		}
@@ -730,6 +770,9 @@ func (r *Repository) Status() (*RepoStatus, error) {
 	}
 
 	for p := range workingFiles {
+		if unmergedPaths[p] {
+			continue
+		}
 		if _, inIndex := indexFiles[p]; !inIndex {
 			res.Untracked = append(res.Untracked, p)
 		}
@@ -737,9 +780,10 @@ func (r *Repository) Status() (*RepoStatus, error) {
 
 	sort.Slice(res.Staged, func(i, j int) bool { return res.Staged[i].Path < res.Staged[j].Path })
 	sort.Slice(res.Unstaged, func(i, j int) bool { return res.Unstaged[i].Path < res.Unstaged[j].Path })
+	sort.Slice(res.Unmerged, func(i, j int) bool { return res.Unmerged[i].Path < res.Unmerged[j].Path })
 	sort.Strings(res.Untracked)
 
-	res.Clean = len(res.Staged) == 0 && len(res.Unstaged) == 0 && len(res.Untracked) == 0
+	res.Clean = len(res.Staged) == 0 && len(res.Unstaged) == 0 && len(res.Untracked) == 0 && len(res.Unmerged) == 0
 	return res, nil
 }
 
@@ -911,13 +955,12 @@ func (r *Repository) Diff(staged bool) (string, error) {
 		}
 
 		idxMap := make(map[string]index.IndexEntry)
-		for _, entry := range idx.Entries {
-			idxMap[entry.Path] = entry
-		}
-
 		allPathsMap := make(map[string]bool)
 		for _, entry := range idx.Entries {
-			allPathsMap[entry.Path] = true
+			if entry.Stage() == 0 {
+				idxMap[entry.Path] = entry
+				allPathsMap[entry.Path] = true
+			}
 		}
 		for p := range headFiles {
 			allPathsMap[p] = true
@@ -960,6 +1003,9 @@ func (r *Repository) Diff(staged bool) (string, error) {
 		}
 	} else {
 		for _, entry := range idx.Entries {
+			if entry.Stage() != 0 {
+				continue
+			}
 			_, data, _, err := object.ReadObject(r.GitDir, hex.EncodeToString(entry.Sha1[:]))
 			if err != nil {
 				continue
@@ -1142,6 +1188,15 @@ func (r *Repository) Merge(target string) (string, error) {
 			if fBase.Hash == fTheirs.Hash {
 				continue
 			}
+			hasConflict = true
+			idx.Remove(p)
+			_, baseData, _, _ := object.ReadObject(r.GitDir, fBase.Hash)
+			_, theirData, _, _ := object.ReadObject(r.GitDir, fTheirs.Hash)
+			idx.AddOrUpdate(createStageEntry(p, 1, fBase.Mode, fBase.Hash, len(baseData)))
+			idx.AddOrUpdate(createStageEntry(p, 3, fTheirs.Mode, fTheirs.Hash, len(theirData)))
+			conflictData := fmt.Sprintf("<<<<<<< HEAD\n=======\n%s>>>>>>> %s\n", string(theirData), target)
+			_ = r.writeFileToWorkDir(filePath, fTheirs.Mode, []byte(conflictData))
+			continue
 		}
 		if inBase && inOurs && !inTheirs {
 			if fBase.Hash == fOurs.Hash {
@@ -1150,6 +1205,15 @@ func (r *Repository) Merge(target string) (string, error) {
 				idx.Remove(p)
 				continue
 			}
+			hasConflict = true
+			idx.Remove(p)
+			_, baseData, _, _ := object.ReadObject(r.GitDir, fBase.Hash)
+			_, ourData, _, _ := object.ReadObject(r.GitDir, fOurs.Hash)
+			idx.AddOrUpdate(createStageEntry(p, 1, fBase.Mode, fBase.Hash, len(baseData)))
+			idx.AddOrUpdate(createStageEntry(p, 2, fOurs.Mode, fOurs.Hash, len(ourData)))
+			conflictData := fmt.Sprintf("<<<<<<< HEAD\n%s=======\n>>>>>>> %s\n", string(ourData), target)
+			_ = r.writeFileToWorkDir(filePath, fOurs.Mode, []byte(conflictData))
+			continue
 		}
 		if inOurs && inTheirs && fOurs.Hash == fTheirs.Hash {
 			continue
@@ -1180,20 +1244,59 @@ func (r *Repository) Merge(target string) (string, error) {
 			}
 		}
 
-		var ourContent, theirContent string
+		var baseData, ourData, theirData []byte
+		if inBase {
+			_, baseData, _, _ = object.ReadObject(r.GitDir, fBase.Hash)
+		}
 		if inOurs {
-			_, data, _, _ := object.ReadObject(r.GitDir, fOurs.Hash)
-			ourContent = string(data)
+			_, ourData, _, _ = object.ReadObject(r.GitDir, fOurs.Hash)
 		}
 		if inTheirs {
-			_, data, _, _ := object.ReadObject(r.GitDir, fTheirs.Hash)
-			theirContent = string(data)
+			_, theirData, _, _ = object.ReadObject(r.GitDir, fTheirs.Hash)
 		}
 
-		conflictData := fmt.Sprintf("<<<<<<< HEAD\n%s=======\n%s>>>>>>> %s\n", ourContent, theirContent, target)
-		hasConflict = true
-		_ = os.MkdirAll(filepath.Dir(filePath), 0755)
-		_ = os.WriteFile(filePath, []byte(conflictData), 0644)
+		mergedContent, fileConflict := diff.Merge3(string(baseData), string(ourData), string(theirData), target)
+		mode := fOurs.Mode
+		if mode == "" {
+			mode = fTheirs.Mode
+		}
+		if err := r.writeFileToWorkDir(filePath, mode, []byte(mergedContent)); err != nil {
+			return "", err
+		}
+
+		if fileConflict {
+			hasConflict = true
+			idx.Remove(p)
+			if inBase {
+				idx.AddOrUpdate(createStageEntry(p, 1, fBase.Mode, fBase.Hash, len(baseData)))
+			}
+			if inOurs {
+				idx.AddOrUpdate(createStageEntry(p, 2, fOurs.Mode, fOurs.Hash, len(ourData)))
+			}
+			if inTheirs {
+				idx.AddOrUpdate(createStageEntry(p, 3, fTheirs.Mode, fTheirs.Hash, len(theirData)))
+			}
+		} else {
+			blobHash, err := object.WriteObject(r.GitDir, object.TypeBlob, []byte(mergedContent))
+			if err != nil {
+				return "", err
+			}
+			hBytes, _ := hex.DecodeString(blobHash)
+			var sha [20]byte
+			copy(sha[:], hBytes)
+			m := uint32(0100644)
+			if mode == "100755" || mode == "0100755" {
+				m = 0100755
+			} else if mode == "120000" || mode == "0120000" {
+				m = 0120000
+			}
+			idx.AddOrUpdate(index.IndexEntry{
+				Mode:     m,
+				FileSize: uint32(len(mergedContent)),
+				Sha1:     sha,
+				Path:     p,
+			})
+		}
 	}
 
 	if hasConflict {
@@ -1313,3 +1416,32 @@ func cleanEmptyDirs(dir, base string) {
 		dir = filepath.Dir(dir)
 	}
 }
+
+func createStageEntry(path string, stage int, mode string, hash string, size int) index.IndexEntry {
+	hBytes, _ := hex.DecodeString(hash)
+	var sha [20]byte
+	copy(sha[:], hBytes)
+
+	m := uint32(0100644)
+	if mode == "100755" || mode == "0100755" {
+		m = 0100755
+	} else if mode == "120000" || mode == "0120000" {
+		m = 0120000
+	}
+
+	flags := uint16(stage&0x3) << 12
+	pathLen := len(path)
+	if pathLen > 0xFFF {
+		pathLen = 0xFFF
+	}
+	flags |= uint16(pathLen)
+
+	return index.IndexEntry{
+		Mode:     m,
+		FileSize: uint32(size),
+		Sha1:     sha,
+		Flags:    flags,
+		Path:     path,
+	}
+}
+

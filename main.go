@@ -294,6 +294,19 @@ func handleStatus(args []string) error {
 		fmt.Println()
 	}
 
+	if len(st.Unmerged) > 0 {
+		fmt.Println("You have unmerged paths.")
+		fmt.Println("  (fix conflicts and run \"minigit commit\")")
+		fmt.Println("  (use \"minigit merge --abort\" to abort the merge)")
+		fmt.Println()
+		fmt.Println("Unmerged paths:")
+		fmt.Println("  (use \"minigit add <file>...\" to mark resolution)")
+		for _, u := range st.Unmerged {
+			fmt.Printf("\t%s:   %s\n", colorRed(string(u.Status)), u.Path)
+		}
+		fmt.Println()
+	}
+
 	if len(st.Unstaged) > 0 {
 		fmt.Println("Changes not staged for commit:")
 		fmt.Println("  (use \"minigit add <file>...\" to update what will be committed)")

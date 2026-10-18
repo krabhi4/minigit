@@ -144,3 +144,25 @@ func TestIndexStageSortingAndRemoval(t *testing.T) {
 	}
 }
 
+func TestBuildTreeWithUnmergedEntries(t *testing.T) {
+	idx := &Index{}
+	sha := sha1.Sum([]byte("blob 1\x00x"))
+	idx.AddOrUpdate(IndexEntry{Path: "conflicted.txt", Flags: 2 << 12, Sha1: sha})
+	if !idx.HasConflicts() {
+		t.Fatalf("expected HasConflicts() to be true")
+	}
+
+	_, err := idx.BuildTree("/tmp")
+	if err == nil {
+		t.Fatalf("expected BuildTree to fail with unmerged entries")
+	}
+	if !strings.Contains(err.Error(), "unmerged") {
+		t.Fatalf("expected error mentioning unmerged, got: %v", err)
+	}
+
+	idx.AddOrUpdate(IndexEntry{Path: "conflicted.txt", Flags: 0, Sha1: sha})
+	if idx.HasConflicts() {
+		t.Fatalf("expected HasConflicts() to be false after stage 0 add")
+	}
+}
+

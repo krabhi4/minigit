@@ -32,8 +32,21 @@ type IndexEntry struct {
 	Path      string
 }
 
+func (e IndexEntry) Stage() int {
+	return int((e.Flags >> 12) & 0x3)
+}
+
 type Index struct {
 	Entries []IndexEntry
+}
+
+func (idx *Index) HasConflicts() bool {
+	for _, entry := range idx.Entries {
+		if entry.Stage() != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (idx *Index) Find(path string) (int, *IndexEntry) {
@@ -46,22 +59,21 @@ func (idx *Index) Find(path string) (int, *IndexEntry) {
 }
 
 func (idx *Index) AddOrUpdate(entry IndexEntry) {
-	entryStage := (entry.Flags >> 12) & 0x3
-	replaced := false
-	for i := range idx.Entries {
-		st := (idx.Entries[i].Flags >> 12) & 0x3
-		if idx.Entries[i].Path == entry.Path && st == entryStage {
-			idx.Entries[i] = entry
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		if entryStage == 0 {
-			idx.Remove(entry.Path)
-		}
+	entryStage := entry.Stage()
+	if entryStage == 0 {
+		idx.Remove(entry.Path)
 		idx.Entries = append(idx.Entries, entry)
+		idx.Sort()
+		return
 	}
+	for i := range idx.Entries {
+		if idx.Entries[i].Path == entry.Path && idx.Entries[i].Stage() == entryStage {
+			idx.Entries[i] = entry
+			idx.Sort()
+			return
+		}
+	}
+	idx.Entries = append(idx.Entries, entry)
 	idx.Sort()
 }
 
@@ -249,6 +261,11 @@ func newTreeBuilderNode() *treeBuilderNode {
 }
 
 func (idx *Index) BuildTree(gitDir string) (string, error) {
+	for _, entry := range idx.Entries {
+		if entry.Stage() != 0 {
+			return "", fmt.Errorf("cannot write tree with unmerged index entries: %s", entry.Path)
+		}
+	}
 	root := newTreeBuilderNode()
 	for _, entry := range idx.Entries {
 		parts := strings.Split(entry.Path, "/")

@@ -2,6 +2,7 @@ package diff
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -303,3 +304,212 @@ func DiffStrings(pathA, pathB, a, b string) string {
 	edits := MyersDiff(linesA, linesB)
 	return FormatUnifiedDiff(pathA, pathB, edits, 3)
 }
+
+type changeChunk struct {
+	baseStart int
+	baseEnd   int
+	lines     []string
+}
+
+type taggedChunk struct {
+	side      int
+	baseStart int
+	baseEnd   int
+	lines     []string
+}
+
+type chunkCluster struct {
+	start int
+	end   int
+	items []taggedChunk
+}
+
+func splitLines(s string) []string {
+	if len(s) == 0 {
+		return nil
+	}
+	trimmed := strings.TrimSuffix(s, "\n")
+	if len(trimmed) == 0 {
+		return []string{""}
+	}
+	return strings.Split(trimmed, "\n")
+}
+
+func editsToChunks(edits []Edit) []changeChunk {
+	var chunks []changeChunk
+	baseIdx := 0
+	inChunk := false
+	var cur changeChunk
+
+	for _, e := range edits {
+		switch e.Op {
+		case OpEqual:
+			if inChunk {
+				cur.baseEnd = baseIdx
+				chunks = append(chunks, cur)
+				inChunk = false
+				cur = changeChunk{}
+			}
+			baseIdx++
+		case OpDelete:
+			if !inChunk {
+				inChunk = true
+				cur.baseStart = baseIdx
+				cur.lines = nil
+			}
+			baseIdx++
+		case OpInsert:
+			if !inChunk {
+				inChunk = true
+				cur.baseStart = baseIdx
+				cur.lines = nil
+			}
+			cur.lines = append(cur.lines, e.Text)
+		}
+	}
+
+	if inChunk {
+		cur.baseEnd = baseIdx
+		chunks = append(chunks, cur)
+	}
+
+	return chunks
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func Merge3(base, ours, theirs, targetName string) (string, bool) {
+	if ours == theirs {
+		return ours, false
+	}
+	if ours == base {
+		return theirs, false
+	}
+	if theirs == base {
+		return ours, false
+	}
+
+	baseLines := splitLines(base)
+	ourLines := splitLines(ours)
+	theirLines := splitLines(theirs)
+
+	editsA := MyersDiff(baseLines, ourLines)
+	chunksA := editsToChunks(editsA)
+
+	editsB := MyersDiff(baseLines, theirLines)
+	chunksB := editsToChunks(editsB)
+
+	var allChunks []taggedChunk
+	for _, c := range chunksA {
+		allChunks = append(allChunks, taggedChunk{side: 1, baseStart: c.baseStart, baseEnd: c.baseEnd, lines: c.lines})
+	}
+	for _, c := range chunksB {
+		allChunks = append(allChunks, taggedChunk{side: 2, baseStart: c.baseStart, baseEnd: c.baseEnd, lines: c.lines})
+	}
+
+	sort.Slice(allChunks, func(i, j int) bool {
+		if allChunks[i].baseStart != allChunks[j].baseStart {
+			return allChunks[i].baseStart < allChunks[j].baseStart
+		}
+		if allChunks[i].baseEnd != allChunks[j].baseEnd {
+			return allChunks[i].baseEnd < allChunks[j].baseEnd
+		}
+		return allChunks[i].side < allChunks[j].side
+	})
+
+	var clusters []chunkCluster
+	for _, tc := range allChunks {
+		if len(clusters) == 0 {
+			clusters = append(clusters, chunkCluster{start: tc.baseStart, end: tc.baseEnd, items: []taggedChunk{tc}})
+		} else {
+			last := &clusters[len(clusters)-1]
+			if tc.baseStart <= last.end {
+				if tc.baseEnd > last.end {
+					last.end = tc.baseEnd
+				}
+				last.items = append(last.items, tc)
+			} else {
+				clusters = append(clusters, chunkCluster{start: tc.baseStart, end: tc.baseEnd, items: []taggedChunk{tc}})
+			}
+		}
+	}
+
+	var out []string
+	curBase := 0
+	hasConflict := false
+
+	for _, cl := range clusters {
+		for curBase < cl.start {
+			out = append(out, baseLines[curBase])
+			curBase++
+		}
+
+		var aChunks, bChunks []taggedChunk
+		for _, it := range cl.items {
+			if it.side == 1 {
+				aChunks = append(aChunks, it)
+			} else {
+				bChunks = append(bChunks, it)
+			}
+		}
+
+		buildLines := func(chunks []taggedChunk) []string {
+			var res []string
+			c := cl.start
+			for _, ch := range chunks {
+				for c < ch.baseStart {
+					res = append(res, baseLines[c])
+					c++
+				}
+				res = append(res, ch.lines...)
+				c = ch.baseEnd
+			}
+			for c < cl.end {
+				res = append(res, baseLines[c])
+				c++
+			}
+			return res
+		}
+
+		linesA := buildLines(aChunks)
+		linesB := buildLines(bChunks)
+
+		if len(bChunks) == 0 {
+			out = append(out, linesA...)
+		} else if len(aChunks) == 0 {
+			out = append(out, linesB...)
+		} else if slicesEqual(linesA, linesB) {
+			out = append(out, linesA...)
+		} else {
+			hasConflict = true
+			out = append(out, "<<<<<<< HEAD")
+			out = append(out, linesA...)
+			out = append(out, "=======")
+			out = append(out, linesB...)
+			out = append(out, ">>>>>>> "+targetName)
+		}
+
+		curBase = cl.end
+	}
+
+	for curBase < len(baseLines) {
+		out = append(out, baseLines[curBase])
+		curBase++
+	}
+
+	if len(out) == 0 {
+		return "", hasConflict
+	}
+	return strings.Join(out, "\n") + "\n", hasConflict
+}
+
