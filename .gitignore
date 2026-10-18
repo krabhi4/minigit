@@ -14,6 +14,8 @@ dist/
 *.out
 *.cov
 coverage.html
+coverage.txt
+coverage.*
 
 # OS metadata
 .DS_Store

@@ -1179,3 +1179,77 @@ func TestCrossCompatibilityCloneStandardGit(t *testing.T) {
 		t.Fatalf("standard git clone could not checkout files from minigit repo: %v, data: %s", err, string(clonedData))
 	}
 }
+
+func TestRevisionResolutionAndCLIDiff(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-integ-rev-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	binPath, err := filepath.Abs("../minigit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	verOut := runCmd(t, tempDir, binPath, "version")
+	if !strings.Contains(verOut, "minigit version") {
+		t.Fatalf("expected version output, got: %s", verOut)
+	}
+
+	runCmd(t, tempDir, binPath, "init")
+	f1 := filepath.Join(tempDir, "sample.txt")
+	if err := os.WriteFile(f1, []byte("first line\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "sample.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "First commit")
+
+	runCmd(t, tempDir, binPath, "branch", "feat", "HEAD")
+	runCmd(t, tempDir, binPath, "tag", "v1.0", "HEAD")
+
+	if err := os.WriteFile(f1, []byte("second line\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "sample.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Second commit")
+
+	logMain := runCmd(t, tempDir, binPath, "log", "main")
+	if !strings.Contains(logMain, "First commit") || !strings.Contains(logMain, "Second commit") {
+		t.Fatalf("unexpected log from main: %s", logMain)
+	}
+
+	logHead := runCmd(t, tempDir, binPath, "log", "HEAD", "--oneline", "-n", "1")
+	if !strings.Contains(logHead, "Second commit") {
+		t.Fatalf("unexpected log from HEAD: %s", logHead)
+	}
+
+	diffCommits := runCmd(t, tempDir, binPath, "diff", "HEAD~1", "HEAD")
+	if !strings.Contains(diffCommits, "-first line") || !strings.Contains(diffCommits, "+second line") {
+		t.Fatalf("unexpected diff between commits: %s", diffCommits)
+	}
+
+	diffBranches := runCmd(t, tempDir, binPath, "diff", "feat", "main")
+	if !strings.Contains(diffBranches, "-first line") || !strings.Contains(diffBranches, "+second line") {
+		t.Fatalf("unexpected diff between branches: %s", diffBranches)
+	}
+
+	if err := os.WriteFile(f1, []byte("worktree modification\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	diffHead := runCmd(t, tempDir, binPath, "diff", "HEAD")
+	if !strings.Contains(diffHead, "-second line") || !strings.Contains(diffHead, "+worktree modification") {
+		t.Fatalf("unexpected diff against HEAD: %s", diffHead)
+	}
+
+	catHead := runCmd(t, tempDir, binPath, "cat-file", "-t", "HEAD")
+	if strings.TrimSpace(catHead) != "commit" {
+		t.Fatalf("expected cat-file -t HEAD to be commit, got: %s", catHead)
+	}
+
+	runCmd(t, tempDir, binPath, "checkout", "v1.0")
+	checkoutData, err := os.ReadFile(f1)
+	if err != nil || string(checkoutData) != "first line\n" {
+		t.Fatalf("expected checked out file at v1.0 to have first line, got: %s", string(checkoutData))
+	}
+}

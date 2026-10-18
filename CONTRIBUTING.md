@@ -27,7 +27,7 @@ Please read this document before submitting issues or pull requests to understan
 ### 1. Clone & Build
 
 ```bash
-git clone https://github.com/your-username/minigit.git
+git clone https://github.com/krabhi4/minigit.git
 cd minigit
 
 # Compile binary locally

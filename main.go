@@ -54,6 +54,9 @@ func main() {
 		err = handleMerge(args)
 	case "tag":
 		err = handleTag(args)
+	case "version", "--version", "-v":
+		fmt.Println("minigit version 1.0.0")
+		return
 	case "help", "-h", "--help":
 		printUsage()
 		return
@@ -87,6 +90,7 @@ func printUsage() {
 	fmt.Println("   diff         Show changes between commits, commit and working tree, etc")
 	fmt.Println("   merge        Join two or more development histories together")
 	fmt.Println("   tag          Create or list tags")
+	fmt.Println("   version      Display version information")
 }
 
 func handleInit(args []string) error {
@@ -172,7 +176,12 @@ func handleCatFile(args []string) error {
 		return err
 	}
 
-	objType, data, _, err := object.ReadObject(r.GitDir, hashPrefix)
+	targetHash := hashPrefix
+	if resolved, err := r.ResolveRevision(hashPrefix); err == nil {
+		targetHash = resolved
+	}
+
+	objType, data, _, err := object.ReadObject(r.GitDir, targetHash)
 	if err != nil {
 		return err
 	}
@@ -459,6 +468,13 @@ func handleBranch(args []string) error {
 	if err != nil {
 		return err
 	}
+	if len(rest) > 1 {
+		resolved, err := r.ResolveRevision(rest[1])
+		if err != nil {
+			return err
+		}
+		headHash = resolved
+	}
 	if headHash == "" {
 		return fmt.Errorf("cannot create branch '%s' without commits", newBranch)
 	}
@@ -509,7 +525,7 @@ func handleDiff(args []string) error {
 	if len(rest) >= 2 {
 		d, err = r.DiffCommits(rest[0], rest[1])
 	} else if len(rest) == 1 {
-		d, err = r.DiffCommits(rest[0], "HEAD")
+		d, err = r.DiffCommit(rest[0])
 	} else {
 		d, err = r.Diff(*staged || *cached)
 	}
@@ -566,7 +582,7 @@ func handleTag(args []string) error {
 	}
 
 	if len(rest) > 1 {
-		resolved, err := object.ResolveObjectHash(r.GitDir, rest[1])
+		resolved, err := r.ResolveRevision(rest[1])
 		if err != nil {
 			return err
 		}

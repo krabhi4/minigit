@@ -1,6 +1,6 @@
 # minigit
 
-[![CI](https://github.com/your-username/minigit/actions/workflows/ci.yml/badge.svg)](https://github.com/your-username/minigit/actions/workflows/ci.yml)
+[![CI](https://github.com/krabhi4/minigit/actions/workflows/ci.yml/badge.svg)](https://github.com/krabhi4/minigit/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/badge/go-%3E%3D1.22-00ADD8?logo=go)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](go.mod)
@@ -85,7 +85,7 @@ minigit/
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/minigit.git
+git clone https://github.com/krabhi4/minigit.git
 cd minigit
 
 # Compile the binary
@@ -108,14 +108,15 @@ go build -o minigit .
 | `rm` | `minigit rm [--cached] <file>...` | Remove files from the working tree and/or index |
 | `commit` | `minigit commit -m <msg> [--author <name <email>>]` | Record staged snapshot as a new commit |
 | `log` | `minigit log [--oneline] [-n <N>] [<rev>]` | Display commit history DAG |
-| `diff` | `minigit diff [--staged\|--cached]` | Show unified diff of workdir or staged changes |
-| `branch` | `minigit branch [-d <name>] [<name>]` | List, create, or delete branches |
+| `diff` | `minigit diff [--staged\|--cached] [<commit>] [<commit2>]` | Show unified diff of workdir, staged changes, or between commits |
+| `branch` | `minigit branch [-d <name>] [<name>] [<start-point>]` | List, create, or delete branches |
 | `checkout` | `minigit checkout <branch-or-commit>` | Switch branches or checkout specific revisions |
 | `merge` | `minigit merge [--abort] <branch-or-commit>` | Merge target branch into current branch |
-| `tag` | `minigit tag [-d <name>] [<name>]` | List, create, or delete lightweight/annotated tags |
+| `tag` | `minigit tag [-d <name>] [<name>] [<target>]` | List, create, or delete lightweight/annotated tags |
 | `hash-object` | `minigit hash-object [-w] [-t <type>] <file>` | Compute object ID and optionally store object |
 | `cat-file` | `minigit cat-file (-p\|-t\|-s) <object>` | Inspect object contents, type, or byte size |
 | `write-tree` | `minigit write-tree` | Build a tree object from current index stages |
+| `version` | `minigit version` | Display version information |
 
 ---
 

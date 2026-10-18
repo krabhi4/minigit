@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -283,6 +284,136 @@ func (r *Repository) ResolveHEAD() (string, bool, string, error) {
 		return "", false, "", err
 	}
 	return "", false, commitHash, nil
+}
+
+func (r *Repository) ResolveRevision(rev string) (string, error) {
+	rev = strings.TrimSpace(rev)
+	if rev == "" {
+		return "", errors.New("empty revision")
+	}
+
+	if idx := strings.Index(rev, "~"); idx != -1 {
+		baseRev := rev[:idx]
+		nStr := rev[idx+1:]
+		n := 1
+		if nStr != "" {
+			var err error
+			n, err = strconv.Atoi(nStr)
+			if err != nil {
+				return "", fmt.Errorf("invalid revision: %s", rev)
+			}
+		}
+		hash, err := r.ResolveRevision(baseRev)
+		if err != nil {
+			return "", err
+		}
+		for i := 0; i < n; i++ {
+			c, err := r.LoadCommit(hash)
+			if err != nil {
+				return "", err
+			}
+			if len(c.ParentHashes) == 0 {
+				return "", fmt.Errorf("revision %s has no parent %d", rev, i+1)
+			}
+			hash = c.ParentHashes[0]
+		}
+		return hash, nil
+	}
+
+	if strings.HasSuffix(rev, "^") {
+		baseRev := strings.TrimSuffix(rev, "^")
+		hash, err := r.ResolveRevision(baseRev)
+		if err != nil {
+			return "", err
+		}
+		c, err := r.LoadCommit(hash)
+		if err != nil {
+			return "", err
+		}
+		if len(c.ParentHashes) == 0 {
+			return "", fmt.Errorf("revision %s has no parent", rev)
+		}
+		return c.ParentHashes[0], nil
+	}
+
+	if rev == "HEAD" {
+		_, _, headHash, err := r.ResolveHEAD()
+		if err != nil {
+			return "", err
+		}
+		if headHash == "" {
+			return "", errors.New("HEAD does not point to any commit")
+		}
+		return headHash, nil
+	}
+
+	if strings.HasPrefix(rev, "refs/") {
+		refFile := filepath.Join(r.GitDir, filepath.FromSlash(rev))
+		if data, err := os.ReadFile(refFile); err == nil {
+			return strings.TrimSpace(string(data)), nil
+		}
+		packed, err := r.ReadPackedRefs()
+		if err == nil {
+			if h, ok := packed[rev]; ok {
+				return h, nil
+			}
+		}
+	}
+
+	headFile := filepath.Join(r.GitDir, "refs", "heads", rev)
+	if data, err := os.ReadFile(headFile); err == nil {
+		return strings.TrimSpace(string(data)), nil
+	}
+
+	tagFile := filepath.Join(r.GitDir, "refs", "tags", rev)
+	if data, err := os.ReadFile(tagFile); err == nil {
+		targetHash := strings.TrimSpace(string(data))
+		objType, objData, _, err := object.ReadObject(r.GitDir, targetHash)
+		if err == nil && objType == object.TypeTag {
+			lines := strings.Split(string(objData), "\n")
+			for _, l := range lines {
+				if strings.HasPrefix(l, "object ") {
+					return strings.TrimSpace(strings.TrimPrefix(l, "object ")), nil
+				}
+			}
+		}
+		return targetHash, nil
+	}
+
+	packed, err := r.ReadPackedRefs()
+	if err == nil {
+		if h, ok := packed["refs/heads/"+rev]; ok {
+			return h, nil
+		}
+		if h, ok := packed["refs/tags/"+rev]; ok {
+			objType, objData, _, err := object.ReadObject(r.GitDir, h)
+			if err == nil && objType == object.TypeTag {
+				lines := strings.Split(string(objData), "\n")
+				for _, l := range lines {
+					if strings.HasPrefix(l, "object ") {
+						return strings.TrimSpace(strings.TrimPrefix(l, "object ")), nil
+					}
+				}
+			}
+			return h, nil
+		}
+	}
+
+	resolved, err := object.ResolveObjectHash(r.GitDir, rev)
+	if err == nil {
+		objType, objData, _, err := object.ReadObject(r.GitDir, resolved)
+		if err == nil && objType == object.TypeTag {
+			lines := strings.Split(string(objData), "\n")
+			for _, l := range lines {
+				if strings.HasPrefix(l, "object ") {
+					return strings.TrimSpace(strings.TrimPrefix(l, "object ")), nil
+				}
+			}
+		}
+		return resolved, nil
+	}
+
+	return "", fmt.Errorf("revision '%s' not found", rev)
 }
 
 func (r *Repository) SetHEADRef(refName string) error {
@@ -992,7 +1123,7 @@ func (r *Repository) Log(startHash string, maxCount int) ([]LogEntry, error) {
 		}
 		startHash = headHash
 	} else {
-		resolved, err := object.ResolveObjectHash(r.GitDir, startHash)
+		resolved, err := r.ResolveRevision(startHash)
 		if err != nil {
 			return nil, err
 		}
@@ -1044,7 +1175,7 @@ func (r *Repository) Checkout(target string) error {
 	}
 
 	if !isBranch {
-		resolved, err := object.ResolveObjectHash(r.GitDir, target)
+		resolved, err := r.ResolveRevision(target)
 		if err != nil {
 			return fmt.Errorf("pathspec '%s' did not match any file(s) known to git", target)
 		}
@@ -1270,11 +1401,11 @@ func (r *Repository) DiffTrees(oldFiles map[string]FlattenedFile, newFiles map[s
 }
 
 func (r *Repository) DiffCommits(commitA, commitB string) (string, error) {
-	hashA, err := object.ResolveObjectHash(r.GitDir, commitA)
+	hashA, err := r.ResolveRevision(commitA)
 	if err != nil {
 		return "", err
 	}
-	hashB, err := object.ResolveObjectHash(r.GitDir, commitB)
+	hashB, err := r.ResolveRevision(commitB)
 	if err != nil {
 		return "", err
 	}
@@ -1298,6 +1429,83 @@ func (r *Repository) DiffCommits(commitA, commitB string) (string, error) {
 	}
 
 	return r.DiffTrees(filesA, filesB)
+}
+
+func (r *Repository) DiffCommit(rev string) (string, error) {
+	hash, err := r.ResolveRevision(rev)
+	if err != nil {
+		return "", err
+	}
+	c, err := r.LoadCommit(hash)
+	if err != nil {
+		return "", err
+	}
+	commitFiles, err := r.FlattenTree(c.TreeHash, "")
+	if err != nil {
+		return "", err
+	}
+
+	idx, _ := r.LoadIndex()
+	allPathsMap := make(map[string]bool)
+	for p := range commitFiles {
+		allPathsMap[p] = true
+	}
+	if idx != nil {
+		for _, e := range idx.Entries {
+			if e.Stage() == 0 {
+				allPathsMap[e.Path] = true
+			}
+		}
+	}
+
+	var allPaths []string
+	for p := range allPathsMap {
+		allPaths = append(allPaths, p)
+	}
+	sort.Strings(allPaths)
+
+	var sb strings.Builder
+	for _, p := range allPaths {
+		oldF, inCommit := commitFiles[p]
+		filePath := filepath.Join(r.WorkDir, filepath.FromSlash(p))
+
+		var workData []byte
+		var exists bool
+		info, err := os.Lstat(filePath)
+		if err == nil {
+			exists = true
+			if info.Mode()&os.ModeSymlink != 0 {
+				target, err := os.Readlink(filePath)
+				if err == nil {
+					workData = []byte(target)
+				}
+			} else {
+				data, err := os.ReadFile(filePath)
+				if err == nil {
+					workData = data
+				}
+			}
+		}
+
+		if inCommit && !exists {
+			_, oldData, _, err := object.ReadObject(r.GitDir, oldF.Hash)
+			if err == nil {
+				d := diff.DiffBytes(p, "/dev/null", oldData, nil)
+				sb.WriteString(d)
+			}
+		} else if !inCommit && exists {
+			d := diff.DiffBytes("/dev/null", p, nil, workData)
+			sb.WriteString(d)
+		} else if inCommit && exists {
+			_, oldData, _, err := object.ReadObject(r.GitDir, oldF.Hash)
+			if err == nil && !bytes.Equal(oldData, workData) {
+				d := diff.DiffBytes(p, p, oldData, workData)
+				sb.WriteString(d)
+			}
+		}
+	}
+
+	return sb.String(), nil
 }
 
 func (r *Repository) Diff(staged bool) (string, error) {
@@ -1419,7 +1627,7 @@ func (r *Repository) Merge(target string) (string, error) {
 		}
 	}
 	if targetCommitHash == "" {
-		resolved, err := object.ResolveObjectHash(r.GitDir, target)
+		resolved, err := r.ResolveRevision(target)
 		if err != nil {
 			return "", fmt.Errorf("could not resolve %s", target)
 		}

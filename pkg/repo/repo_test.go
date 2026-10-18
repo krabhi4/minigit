@@ -923,3 +923,98 @@ func TestRepoBinaryMergeConflict(t *testing.T) {
 		t.Fatalf("expected clean status after merge abort, got: %+v", stAfter)
 	}
 }
+
+func TestResolveRevisionAndDiff(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-rev-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	r, err := Init(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f1 := filepath.Join(tempDir, "file.txt")
+	if err := os.WriteFile(f1, []byte("v1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"file.txt"}, false); err != nil {
+		t.Fatal(err)
+	}
+	c1, err := r.Commit("Commit 1", "Tester <t@t.com>")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(f1, []byte("v2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"file.txt"}, false); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := r.Commit("Commit 2", "Tester <t@t.com>")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tagPath := filepath.Join(r.GitDir, "refs", "tags", "v2.0")
+	if err := os.WriteFile(tagPath, []byte(c2+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	revHead, err := r.ResolveRevision("HEAD")
+	if err != nil || revHead != c2 {
+		t.Fatalf("expected HEAD to resolve to %s, got %s (err: %v)", c2, revHead, err)
+	}
+
+	revMain, err := r.ResolveRevision("main")
+	if err != nil || revMain != c2 {
+		t.Fatalf("expected main to resolve to %s, got %s (err: %v)", c2, revMain, err)
+	}
+
+	revTag, err := r.ResolveRevision("v2.0")
+	if err != nil || revTag != c2 {
+		t.Fatalf("expected tag v2.0 to resolve to %s, got %s (err: %v)", c2, revTag, err)
+	}
+
+	revParent, err := r.ResolveRevision("HEAD~1")
+	if err != nil || revParent != c1 {
+		t.Fatalf("expected HEAD~1 to resolve to %s, got %s (err: %v)", c1, revParent, err)
+	}
+
+	revCaret, err := r.ResolveRevision("HEAD^")
+	if err != nil || revCaret != c1 {
+		t.Fatalf("expected HEAD^ to resolve to %s, got %s (err: %v)", c1, revCaret, err)
+	}
+
+	revShort, err := r.ResolveRevision(c1[:7])
+	if err != nil || revShort != c1 {
+		t.Fatalf("expected short prefix to resolve to %s, got %s (err: %v)", c1, revShort, err)
+	}
+
+	diffCommits, err := r.DiffCommits("HEAD~1", "HEAD")
+	if err != nil {
+		t.Fatalf("DiffCommits failed: %v", err)
+	}
+	if !strings.Contains(diffCommits, "-v1") || !strings.Contains(diffCommits, "+v2") {
+		t.Fatalf("unexpected DiffCommits output: %s", diffCommits)
+	}
+
+	if err := os.WriteFile(f1, []byte("v3\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	diffWork, err := r.DiffCommit("HEAD")
+	if err != nil {
+		t.Fatalf("DiffCommit failed: %v", err)
+	}
+	if !strings.Contains(diffWork, "-v2") || !strings.Contains(diffWork, "+v3") {
+		t.Fatalf("unexpected DiffCommit output: %s", diffWork)
+	}
+
+	logs, err := r.Log("main", 0)
+	if err != nil || len(logs) != 2 {
+		t.Fatalf("expected 2 log entries from main, got %d (err: %v)", len(logs), err)
+	}
+}
