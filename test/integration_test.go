@@ -1116,7 +1116,7 @@ func TestCrossCompatibilityCloneStandardGit(t *testing.T) {
 	if err := os.MkdirAll(gitSrc, 0755); err != nil {
 		t.Fatal(err)
 	}
-	runCmd(t, gitSrc, "git", "init")
+	runCmd(t, gitSrc, "git", "init", "-b", "main")
 	if err := os.WriteFile(filepath.Join(gitSrc, "file1.txt"), []byte("standard git commit 1\n"), 0644); err != nil {
 		t.Fatal(err)
 	}

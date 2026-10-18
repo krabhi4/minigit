@@ -28,7 +28,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
-          cache: true
+          cache: false
 
       - name: Check formatting
         run: |
