@@ -1,6 +1,7 @@
 package diff
 
 import (
+	"bytes"
 	"fmt"
 	"sort"
 	"strings"
@@ -293,16 +294,84 @@ func FormatUnifiedDiff(pathA, pathB string, edits []Edit, contextLines int) stri
 	return sb.String()
 }
 
-func DiffStrings(pathA, pathB, a, b string) string {
+func IsBinary(data []byte) bool {
+	limit := len(data)
+	if limit > 8000 {
+		limit = 8000
+	}
+	return bytes.IndexByte(data[:limit], 0) != -1
+}
+
+func FormatBinaryDiff(pathA, pathB string) string {
+	aName := "/dev/null"
+	if pathA != "/dev/null" && pathA != "" {
+		aName = "a/" + pathA
+	}
+	bName := "/dev/null"
+	if pathB != "/dev/null" && pathB != "" {
+		bName = "b/" + pathB
+	}
+	return fmt.Sprintf("Binary files %s and %s differ\n", aName, bName)
+}
+
+func DiffBytes(pathA, pathB string, a, b []byte) string {
+	if bytes.Equal(a, b) {
+		return ""
+	}
+	if IsBinary(a) || IsBinary(b) {
+		return FormatBinaryDiff(pathA, pathB)
+	}
 	var linesA, linesB []string
 	if len(a) > 0 {
-		linesA = strings.Split(strings.TrimSuffix(a, "\n"), "\n")
+		linesA = splitLines(string(a))
 	}
 	if len(b) > 0 {
-		linesB = strings.Split(strings.TrimSuffix(b, "\n"), "\n")
+		linesB = splitLines(string(b))
 	}
 	edits := MyersDiff(linesA, linesB)
 	return FormatUnifiedDiff(pathA, pathB, edits, 3)
+}
+
+func DiffStrings(pathA, pathB, a, b string) string {
+	return DiffBytes(pathA, pathB, []byte(a), []byte(b))
+}
+
+func ComputeSimilarity(oldData, newData []byte) int {
+	if bytes.Equal(oldData, newData) {
+		return 100
+	}
+	if IsBinary(oldData) || IsBinary(newData) {
+		return 0
+	}
+	linesOld := splitLines(string(oldData))
+	linesNew := splitLines(string(newData))
+	maxLines := len(linesOld)
+	if len(linesNew) > maxLines {
+		maxLines = len(linesNew)
+	}
+	if maxLines == 0 {
+		return 100
+	}
+	edits := MyersDiff(linesOld, linesNew)
+	equalLines := 0
+	for _, e := range edits {
+		if e.Op == OpEqual {
+			equalLines++
+		}
+	}
+	return (equalLines * 100) / maxLines
+}
+
+func FormatRenameDiff(oldPath, newPath string, similarity int, oldData, newData []byte) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("similarity index %d%%\n", similarity))
+	sb.WriteString(fmt.Sprintf("rename from %s\n", oldPath))
+	sb.WriteString(fmt.Sprintf("rename to %s\n", newPath))
+	if similarity < 100 && len(oldData) > 0 && len(newData) > 0 {
+		contentDiff := DiffBytes(oldPath, newPath, oldData, newData)
+		sb.WriteString(contentDiff)
+	}
+	return sb.String()
 }
 
 type changeChunk struct {
@@ -389,6 +458,19 @@ func slicesEqual(a, b []string) bool {
 }
 
 func Merge3(base, ours, theirs, targetName string) (string, bool) {
+	if IsBinary([]byte(base)) || IsBinary([]byte(ours)) || IsBinary([]byte(theirs)) {
+		if ours == theirs {
+			return ours, false
+		}
+		if ours == base {
+			return theirs, false
+		}
+		if theirs == base {
+			return ours, false
+		}
+		return ours, true
+	}
+
 	if ours == theirs {
 		return ours, false
 	}
@@ -517,3 +599,19 @@ func Merge3(base, ours, theirs, targetName string) (string, bool) {
 	return res, hasConflict
 }
 
+func Merge3Bytes(base, ours, theirs []byte, targetName string) ([]byte, bool) {
+	if IsBinary(base) || IsBinary(ours) || IsBinary(theirs) {
+		if bytes.Equal(ours, theirs) {
+			return ours, false
+		}
+		if bytes.Equal(ours, base) {
+			return theirs, false
+		}
+		if bytes.Equal(theirs, base) {
+			return ours, false
+		}
+		return ours, true
+	}
+	res, conflict := Merge3(string(base), string(ours), string(theirs), targetName)
+	return []byte(res), conflict
+}

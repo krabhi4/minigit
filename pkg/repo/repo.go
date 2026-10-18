@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"minigit/pkg/diff"
+	"minigit/pkg/ignore"
 	"minigit/pkg/index"
 	"minigit/pkg/object"
 )
@@ -58,6 +60,142 @@ func Init(workDir string) (*Repository, error) {
 		WorkDir: absWorkDir,
 		GitDir:  gitDir,
 	}, nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, in)
+	return err
+}
+
+func copyDir(src, dst string) error {
+	if _, err := os.Stat(src); os.IsNotExist(err) {
+		return nil
+	}
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0755)
+		}
+		return copyFile(path, target)
+	})
+}
+
+func Clone(srcPath, dstPath string) (*Repository, error) {
+	srcAbs, err := filepath.Abs(srcPath)
+	if err != nil {
+		return nil, err
+	}
+
+	srcGitDir := filepath.Join(srcAbs, ".git")
+	if info, err := os.Stat(srcGitDir); err != nil || !info.IsDir() {
+		headFile := filepath.Join(srcAbs, "HEAD")
+		if _, err := os.Stat(headFile); err == nil {
+			srcGitDir = srcAbs
+		} else {
+			return nil, fmt.Errorf("repository '%s' does not exist", srcPath)
+		}
+	}
+
+	if dstPath == "" {
+		base := filepath.Base(filepath.Clean(srcPath))
+		dstPath = strings.TrimSuffix(base, ".git")
+	}
+
+	dstAbs, err := filepath.Abs(dstPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if entries, err := os.ReadDir(dstAbs); err == nil && len(entries) > 0 {
+		return nil, fmt.Errorf("destination path '%s' already exists and is not an empty directory", dstPath)
+	}
+
+	dstGitDir := filepath.Join(dstAbs, ".git")
+	if err := os.MkdirAll(dstGitDir, 0755); err != nil {
+		return nil, err
+	}
+
+	srcObjects := filepath.Join(srcGitDir, "objects")
+	dstObjects := filepath.Join(dstGitDir, "objects")
+	if err := copyDir(srcObjects, dstObjects); err != nil {
+		return nil, err
+	}
+
+	srcRefs := filepath.Join(srcGitDir, "refs")
+	dstRefs := filepath.Join(dstGitDir, "refs")
+	if err := copyDir(srcRefs, dstRefs); err != nil {
+		return nil, err
+	}
+
+	srcPackedRefs := filepath.Join(srcGitDir, "packed-refs")
+	if _, err := os.Stat(srcPackedRefs); err == nil {
+		if err := copyFile(srcPackedRefs, filepath.Join(dstGitDir, "packed-refs")); err != nil {
+			return nil, err
+		}
+	}
+
+	srcHead := filepath.Join(srcGitDir, "HEAD")
+	if err := copyFile(srcHead, filepath.Join(dstGitDir, "HEAD")); err != nil {
+		return nil, err
+	}
+
+	configPath := filepath.Join(dstGitDir, "config")
+	configContent := "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n"
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		return nil, err
+	}
+
+	r := &Repository{
+		WorkDir: dstAbs,
+		GitDir:  dstGitDir,
+	}
+
+	branchName, isSymbolic, headHash, err := r.ResolveHEAD()
+	if err != nil {
+		return nil, err
+	}
+
+	if headHash != "" {
+		if isSymbolic && branchName != "" {
+			if err := r.Checkout(branchName); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := r.Checkout(headHash); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return r, nil
 }
 
 func FindRepo(startDir string) (*Repository, error) {
@@ -300,12 +438,14 @@ func resolveBaseDir(workDir string) string {
 	return baseDir
 }
 
-func (r *Repository) Add(patterns []string) error {
+func (r *Repository) Add(patterns []string, force ...bool) error {
 	idx, err := r.LoadIndex()
 	if err != nil {
 		return err
 	}
 
+	forceMode := len(force) > 0 && force[0]
+	matcher, _ := ignore.LoadMatcher(r.WorkDir)
 	baseDir := resolveBaseDir(r.WorkDir)
 
 	for _, pattern := range patterns {
@@ -352,15 +492,31 @@ func (r *Repository) Add(patterns []string) error {
 				if d.IsDir() && d.Name() == ".git" {
 					return filepath.SkipDir
 				}
-				if !d.IsDir() {
-					return r.addSinglePath(idx, path)
+				rel, err := filepath.Rel(r.WorkDir, path)
+				if err != nil {
+					return err
 				}
-				return nil
+				gitPath := filepath.ToSlash(rel)
+				if d.IsDir() {
+					if gitPath != "." && matcher != nil && matcher.IsIgnored(gitPath, true) {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				if !forceMode && !idx.Has(gitPath) && matcher != nil && matcher.IsIgnored(gitPath, false) {
+					return nil
+				}
+				return r.addSinglePath(idx, path)
 			})
 			if err != nil {
 				return err
 			}
 		} else {
+			rel, _ := filepath.Rel(r.WorkDir, absPath)
+			gitPath := filepath.ToSlash(rel)
+			if !forceMode && !idx.Has(gitPath) && matcher != nil && matcher.IsIgnored(gitPath, false) {
+				return fmt.Errorf("The following paths are ignored by one of your .gitignore files:\n%s\nUse -f if you really want to add them.", gitPath)
+			}
 			if err := r.addSinglePath(idx, absPath); err != nil {
 				return err
 			}
@@ -376,7 +532,7 @@ func (r *Repository) addSinglePath(idx *index.Index, absPath string) error {
 		return err
 	}
 	gitPath := filepath.ToSlash(relPath)
-	if strings.HasPrefix(gitPath, ".git") {
+	if gitPath == ".git" || strings.HasPrefix(gitPath, ".git/") {
 		return nil
 	}
 
@@ -738,6 +894,7 @@ func (r *Repository) Status() (*RepoStatus, error) {
 		}
 	}
 
+	matcher, _ := ignore.LoadMatcher(r.WorkDir)
 	workingFiles := make(map[string]os.FileInfo)
 	err = filepath.WalkDir(r.WorkDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -746,18 +903,27 @@ func (r *Repository) Status() (*RepoStatus, error) {
 		if d.IsDir() && d.Name() == ".git" {
 			return filepath.SkipDir
 		}
-		if !d.IsDir() {
-			rel, err := filepath.Rel(r.WorkDir, path)
-			if err != nil {
-				return err
-			}
-			gitPath := filepath.ToSlash(rel)
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			workingFiles[gitPath] = info
+		rel, err := filepath.Rel(r.WorkDir, path)
+		if err != nil {
+			return err
 		}
+		gitPath := filepath.ToSlash(rel)
+		if d.IsDir() {
+			if gitPath != "." && matcher != nil && matcher.IsIgnored(gitPath, true) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if _, inIndex := indexFiles[gitPath]; !inIndex {
+			if matcher != nil && matcher.IsIgnored(gitPath, false) {
+				return nil
+			}
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		workingFiles[gitPath] = info
 		return nil
 	})
 	if err != nil {
@@ -952,13 +1118,193 @@ func (r *Repository) Checkout(target string) error {
 	return r.SetHEADDetached(targetCommitHash)
 }
 
+type diffItem struct {
+	sortPath string
+	content  string
+}
+
+type fileEntry struct {
+	path string
+	mode string
+	hash string
+	data []byte
+}
+
+type renamePair struct {
+	oldEntry   fileEntry
+	newEntry   fileEntry
+	similarity int
+}
+
+func (r *Repository) DiffTrees(oldFiles map[string]FlattenedFile, newFiles map[string]FlattenedFile) (string, error) {
+	var deleted []fileEntry
+	var added []fileEntry
+	var modified []fileEntry
+
+	allPathsMap := make(map[string]bool)
+	for p := range oldFiles {
+		allPathsMap[p] = true
+	}
+	for p := range newFiles {
+		allPathsMap[p] = true
+	}
+
+	for p := range allPathsMap {
+		oldF, inOld := oldFiles[p]
+		newF, inNew := newFiles[p]
+
+		if inOld && inNew {
+			if oldF.Hash != newF.Hash {
+				_, _, _, err1 := object.ReadObject(r.GitDir, oldF.Hash)
+				_, newData, _, err2 := object.ReadObject(r.GitDir, newF.Hash)
+				if err1 == nil && err2 == nil {
+					modified = append(modified, fileEntry{path: p, mode: newF.Mode, hash: newF.Hash, data: newData})
+				}
+			}
+		} else if inOld && !inNew {
+			_, oldData, _, err := object.ReadObject(r.GitDir, oldF.Hash)
+			if err == nil {
+				deleted = append(deleted, fileEntry{path: p, mode: oldF.Mode, hash: oldF.Hash, data: oldData})
+			}
+		} else if !inOld && inNew {
+			_, newData, _, err := object.ReadObject(r.GitDir, newF.Hash)
+			if err == nil {
+				added = append(added, fileEntry{path: p, mode: newF.Mode, hash: newF.Hash, data: newData})
+			}
+		}
+	}
+
+	deletedMatched := make(map[string]bool)
+	addedMatched := make(map[string]bool)
+	var renames []renamePair
+
+	for _, del := range deleted {
+		if deletedMatched[del.path] {
+			continue
+		}
+		for _, add := range added {
+			if addedMatched[add.path] {
+				continue
+			}
+			if del.hash == add.hash || bytes.Equal(del.data, add.data) {
+				renames = append(renames, renamePair{oldEntry: del, newEntry: add, similarity: 100})
+				deletedMatched[del.path] = true
+				addedMatched[add.path] = true
+				break
+			}
+		}
+	}
+
+	type candidate struct {
+		del   fileEntry
+		add   fileEntry
+		score int
+	}
+	var candidates []candidate
+	for _, del := range deleted {
+		if deletedMatched[del.path] {
+			continue
+		}
+		for _, add := range added {
+			if addedMatched[add.path] {
+				continue
+			}
+			score := diff.ComputeSimilarity(del.data, add.data)
+			if score >= 50 {
+				candidates = append(candidates, candidate{del: del, add: add, score: score})
+			}
+		}
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
+
+	for _, c := range candidates {
+		if deletedMatched[c.del.path] || addedMatched[c.add.path] {
+			continue
+		}
+		renames = append(renames, renamePair{oldEntry: c.del, newEntry: c.add, similarity: c.score})
+		deletedMatched[c.del.path] = true
+		addedMatched[c.add.path] = true
+	}
+
+	var items []diffItem
+
+	for _, rn := range renames {
+		content := diff.FormatRenameDiff(rn.oldEntry.path, rn.newEntry.path, rn.similarity, rn.oldEntry.data, rn.newEntry.data)
+		items = append(items, diffItem{sortPath: rn.newEntry.path, content: content})
+	}
+
+	for _, del := range deleted {
+		if !deletedMatched[del.path] {
+			content := diff.DiffBytes(del.path, "/dev/null", del.data, nil)
+			items = append(items, diffItem{sortPath: del.path, content: content})
+		}
+	}
+
+	for _, add := range added {
+		if !addedMatched[add.path] {
+			content := diff.DiffBytes("/dev/null", add.path, nil, add.data)
+			items = append(items, diffItem{sortPath: add.path, content: content})
+		}
+	}
+
+	for _, mod := range modified {
+		oldF := oldFiles[mod.path]
+		_, oldData, _, _ := object.ReadObject(r.GitDir, oldF.Hash)
+		content := diff.DiffBytes(mod.path, mod.path, oldData, mod.data)
+		items = append(items, diffItem{sortPath: mod.path, content: content})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].sortPath < items[j].sortPath
+	})
+
+	var sb strings.Builder
+	for _, it := range items {
+		sb.WriteString(it.content)
+	}
+
+	return sb.String(), nil
+}
+
+func (r *Repository) DiffCommits(commitA, commitB string) (string, error) {
+	hashA, err := object.ResolveObjectHash(r.GitDir, commitA)
+	if err != nil {
+		return "", err
+	}
+	hashB, err := object.ResolveObjectHash(r.GitDir, commitB)
+	if err != nil {
+		return "", err
+	}
+
+	cA, err := r.LoadCommit(hashA)
+	if err != nil {
+		return "", err
+	}
+	cB, err := r.LoadCommit(hashB)
+	if err != nil {
+		return "", err
+	}
+
+	filesA, err := r.FlattenTree(cA.TreeHash, "")
+	if err != nil {
+		return "", err
+	}
+	filesB, err := r.FlattenTree(cB.TreeHash, "")
+	if err != nil {
+		return "", err
+	}
+
+	return r.DiffTrees(filesA, filesB)
+}
+
 func (r *Repository) Diff(staged bool) (string, error) {
 	idx, err := r.LoadIndex()
 	if err != nil {
 		return "", err
 	}
-
-	var sb strings.Builder
 
 	if staged {
 		_, _, headHash, err := r.ResolveHEAD()
@@ -984,102 +1330,67 @@ func (r *Repository) Diff(staged bool) (string, error) {
 			}
 		}
 
-		idxMap := make(map[string]index.IndexEntry)
-		allPathsMap := make(map[string]bool)
+		filteredHead := make(map[string]FlattenedFile)
+		for p, f := range headFiles {
+			if !unmergedPaths[p] {
+				filteredHead[p] = f
+			}
+		}
+
+		idxFiles := make(map[string]FlattenedFile)
 		for _, entry := range idx.Entries {
-			if entry.Stage() == 0 {
-				idxMap[entry.Path] = entry
-				allPathsMap[entry.Path] = true
-			}
-		}
-		for p := range headFiles {
-			if unmergedPaths[p] {
-				continue
-			}
-			allPathsMap[p] = true
-		}
-
-		var allPaths []string
-		for p := range allPathsMap {
-			allPaths = append(allPaths, p)
-		}
-		sort.Strings(allPaths)
-
-		for _, p := range allPaths {
-			if unmergedPaths[p] {
-				continue
-			}
-			idxEntry, inIdx := idxMap[p]
-			headEntry, inHead := headFiles[p]
-
-			if inIdx && inHead {
-				idxSha := hex.EncodeToString(idxEntry.Sha1[:])
-				if idxSha != headEntry.Hash {
-					_, oldData, _, err1 := object.ReadObject(r.GitDir, headEntry.Hash)
-					_, newData, _, err2 := object.ReadObject(r.GitDir, idxSha)
-					if err1 == nil && err2 == nil {
-						d := diff.DiffStrings(p, p, string(oldData), string(newData))
-						sb.WriteString(d)
-					}
-				}
-			} else if inIdx && !inHead {
-				idxSha := hex.EncodeToString(idxEntry.Sha1[:])
-				_, newData, _, err := object.ReadObject(r.GitDir, idxSha)
-				if err == nil {
-					d := diff.DiffStrings("/dev/null", p, "", string(newData))
-					sb.WriteString(d)
-				}
-			} else if !inIdx && inHead {
-				_, oldData, _, err := object.ReadObject(r.GitDir, headEntry.Hash)
-				if err == nil {
-					d := diff.DiffStrings(p, "/dev/null", string(oldData), "")
-					sb.WriteString(d)
+			if entry.Stage() == 0 && !unmergedPaths[entry.Path] {
+				idxFiles[entry.Path] = FlattenedFile{
+					Mode: fmt.Sprintf("%o", entry.Mode),
+					Hash: hex.EncodeToString(entry.Sha1[:]),
 				}
 			}
 		}
-	} else {
-		for _, entry := range idx.Entries {
-			if entry.Stage() != 0 {
+
+		return r.DiffTrees(filteredHead, idxFiles)
+	}
+
+	var sb strings.Builder
+	for _, entry := range idx.Entries {
+		if entry.Stage() != 0 {
+			continue
+		}
+		_, data, _, err := object.ReadObject(r.GitDir, hex.EncodeToString(entry.Sha1[:]))
+		if err != nil {
+			continue
+		}
+
+		filePath := filepath.Join(r.WorkDir, filepath.FromSlash(entry.Path))
+		var newData []byte
+		var isDeleted bool
+
+		info, err := os.Lstat(filePath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				isDeleted = true
+			} else {
 				continue
 			}
-			_, data, _, err := object.ReadObject(r.GitDir, hex.EncodeToString(entry.Sha1[:]))
+		} else if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(filePath)
 			if err != nil {
 				continue
 			}
-			oldContent := string(data)
-
-			filePath := filepath.Join(r.WorkDir, filepath.FromSlash(entry.Path))
-			var newContent string
-			var isDeleted bool
-
-			info, err := os.Lstat(filePath)
+			newData = []byte(target)
+		} else {
+			readData, err := os.ReadFile(filePath)
 			if err != nil {
-				if os.IsNotExist(err) {
-					isDeleted = true
-				} else {
-					continue
-				}
-			} else if info.Mode()&os.ModeSymlink != 0 {
-				target, err := os.Readlink(filePath)
-				if err != nil {
-					continue
-				}
-				newContent = target
-			} else {
-				newData, err := os.ReadFile(filePath)
-				if err != nil {
-					continue
-				}
-				newContent = string(newData)
+				continue
 			}
+			newData = readData
+		}
 
-			if isDeleted {
-				d := diff.DiffStrings(entry.Path, "/dev/null", oldContent, "")
-				sb.WriteString(d)
-			} else {
-				d := diff.DiffStrings(entry.Path, entry.Path, oldContent, newContent)
-				sb.WriteString(d)
-			}
+		if isDeleted {
+			d := diff.DiffBytes(entry.Path, "/dev/null", data, nil)
+			sb.WriteString(d)
+		} else if !bytes.Equal(data, newData) {
+			d := diff.DiffBytes(entry.Path, entry.Path, data, newData)
+			sb.WriteString(d)
 		}
 	}
 
@@ -1287,6 +1598,25 @@ func (r *Repository) Merge(target string) (string, error) {
 		}
 		if inTheirs {
 			_, theirData, _, _ = object.ReadObject(r.GitDir, fTheirs.Hash)
+		}
+
+		if diff.IsBinary(baseData) || diff.IsBinary(ourData) || diff.IsBinary(theirData) {
+			hasConflict = true
+			idx.Remove(p)
+			if inBase {
+				idx.AddOrUpdate(createStageEntry(p, 1, fBase.Mode, fBase.Hash, len(baseData)))
+			}
+			if inOurs {
+				idx.AddOrUpdate(createStageEntry(p, 2, fOurs.Mode, fOurs.Hash, len(ourData)))
+				_ = r.writeFileToWorkDir(filePath, fOurs.Mode, ourData)
+			}
+			if inTheirs {
+				idx.AddOrUpdate(createStageEntry(p, 3, fTheirs.Mode, fTheirs.Hash, len(theirData)))
+				if !inOurs {
+					_ = r.writeFileToWorkDir(filePath, fTheirs.Mode, theirData)
+				}
+			}
+			continue
 		}
 
 		mergedContent, fileConflict := diff.Merge3(string(baseData), string(ourData), string(theirData), target)
@@ -1554,4 +1884,3 @@ func createStageEntry(path string, stage int, mode string, hash string, size int
 		Path:     path,
 	}
 }
-

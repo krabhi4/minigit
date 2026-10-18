@@ -165,4 +165,3 @@ func TestBuildTreeWithUnmergedEntries(t *testing.T) {
 		t.Fatalf("expected HasConflicts() to be false after stage 0 add")
 	}
 }
-

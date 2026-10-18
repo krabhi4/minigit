@@ -58,6 +58,15 @@ func (idx *Index) Find(path string) (int, *IndexEntry) {
 	return -1, nil
 }
 
+func (idx *Index) Has(path string) bool {
+	for i := range idx.Entries {
+		if idx.Entries[i].Path == path {
+			return true
+		}
+	}
+	return false
+}
+
 func (idx *Index) AddOrUpdate(entry IndexEntry) {
 	entryStage := entry.Stage()
 	if entryStage == 0 {

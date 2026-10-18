@@ -203,5 +203,94 @@ func TestMerge3TrailingNewlinePreserved(t *testing.T) {
 	}
 }
 
+func TestBinaryDetectionAndDiff(t *testing.T) {
+	textData := []byte("hello world\nthis is plain text\n")
+	if IsBinary(textData) {
+		t.Fatalf("expected textData not to be binary")
+	}
 
+	binData := []byte("hello\x00world\x01\x02")
+	if !IsBinary(binData) {
+		t.Fatalf("expected binData to be binary")
+	}
 
+	diffSame := DiffBytes("bin.dat", "bin.dat", binData, binData)
+	if diffSame != "" {
+		t.Fatalf("expected identical binary diff to be empty, got %q", diffSame)
+	}
+
+	binData2 := []byte("hello\x00different\x03")
+	diffMod := DiffBytes("bin.dat", "bin.dat", binData, binData2)
+	if !strings.Contains(diffMod, "Binary files a/bin.dat and b/bin.dat differ") {
+		t.Fatalf("expected binary diff format, got %q", diffMod)
+	}
+
+	diffNew := DiffBytes("/dev/null", "bin.dat", nil, binData)
+	if !strings.Contains(diffNew, "Binary files /dev/null and b/bin.dat differ") {
+		t.Fatalf("expected new binary file format, got %q", diffNew)
+	}
+
+	diffDel := DiffBytes("bin.dat", "/dev/null", binData, nil)
+	if !strings.Contains(diffDel, "Binary files a/bin.dat and /dev/null differ") {
+		t.Fatalf("expected deleted binary file format, got %q", diffDel)
+	}
+}
+
+func TestBinaryMergeConflict(t *testing.T) {
+	base := []byte("base\x00data")
+	ours := []byte("ours\x00data")
+	theirs := []byte("theirs\x00data")
+
+	res, conflict := Merge3Bytes(base, ours, theirs, "target")
+	if !conflict {
+		t.Fatalf("expected binary conflict")
+	}
+	if string(res) != string(ours) {
+		t.Fatalf("expected binary conflict to retain ours, got %q", string(res))
+	}
+
+	cleanRes, cleanConflict := Merge3Bytes(base, ours, ours, "target")
+	if cleanConflict {
+		t.Fatalf("expected identical binary changes to not conflict")
+	}
+	if string(cleanRes) != string(ours) {
+		t.Fatalf("expected clean merge of identical binary data, got %q", string(cleanRes))
+	}
+}
+
+func TestSimilarityIndexAndRenameFormat(t *testing.T) {
+	a := []byte("line1\nline2\nline3\nline4\n")
+	b := []byte("line1\nline2\nline3\nline4\n")
+	score100 := ComputeSimilarity(a, b)
+	if score100 != 100 {
+		t.Fatalf("expected 100%% similarity, got %d", score100)
+	}
+
+	c := []byte("line1\nline2\nline3\nmodified4\n")
+	score75 := ComputeSimilarity(a, c)
+	if score75 != 75 {
+		t.Fatalf("expected 75%% similarity, got %d", score75)
+	}
+
+	diff100 := FormatRenameDiff("old.txt", "new.txt", 100, a, b)
+	if !strings.Contains(diff100, "similarity index 100%") {
+		t.Fatalf("missing similarity index 100%%: %s", diff100)
+	}
+	if !strings.Contains(diff100, "rename from old.txt") || !strings.Contains(diff100, "rename to new.txt") {
+		t.Fatalf("missing rename headers: %s", diff100)
+	}
+	if strings.Contains(diff100, "---") || strings.Contains(diff100, "+++") {
+		t.Fatalf("100%% rename should not have unified diff hunks: %s", diff100)
+	}
+
+	diff75 := FormatRenameDiff("old.txt", "new.txt", 75, a, c)
+	if !strings.Contains(diff75, "similarity index 75%") {
+		t.Fatalf("missing similarity index 75%%: %s", diff75)
+	}
+	if !strings.Contains(diff75, "--- a/old.txt") || !strings.Contains(diff75, "+++ b/new.txt") {
+		t.Fatalf("partial rename should include unified diff hunks: %s", diff75)
+	}
+	if !strings.Contains(diff75, "-line4") || !strings.Contains(diff75, "+modified4") {
+		t.Fatalf("partial rename missing hunk edits: %s", diff75)
+	}
+}

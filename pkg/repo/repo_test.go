@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -655,4 +656,270 @@ func TestRepoModifyDeleteConflict(t *testing.T) {
 	}
 }
 
+func TestRepoClone(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-clone-src-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
 
+	srcRepo, err := Init(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f1 := filepath.Join(tempDir, "hello.txt")
+	if err := os.WriteFile(f1, []byte("hello clone\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := srcRepo.Add([]string{"hello.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	commitHash, err := srcRepo.Commit("commit for clone", "Tester <test@example.com>")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dstDir, err := os.MkdirTemp("", "minigit-clone-dst-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dstDir)
+	targetDir := filepath.Join(dstDir, "cloned_repo")
+
+	clonedRepo, err := Clone(tempDir, targetDir)
+	if err != nil {
+		t.Fatalf("Clone failed: %v", err)
+	}
+
+	branch, _, headHash, err := clonedRepo.ResolveHEAD()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch != "main" || headHash != commitHash {
+		t.Fatalf("mismatched cloned HEAD: branch=%s, hash=%s, expected=%s", branch, headHash, commitHash)
+	}
+
+	clonedFile := filepath.Join(targetDir, "hello.txt")
+	data, err := os.ReadFile(clonedFile)
+	if err != nil {
+		t.Fatalf("failed to read cloned file: %v", err)
+	}
+	if string(data) != "hello clone\n" {
+		t.Fatalf("unexpected cloned file content: %q", string(data))
+	}
+}
+
+func TestRepoIgnore(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-repo-ignore-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	r, err := Init(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(tempDir, ".gitignore"), []byte("*.log\nsecret/\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "app.log"), []byte("log entry\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tempDir, "secret"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "secret", "key.txt"), []byte("secret key\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "main.txt"), []byte("valid file\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := r.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range st.Untracked {
+		if strings.HasSuffix(u, ".log") || strings.HasPrefix(u, "secret/") {
+			t.Fatalf("ignored file appeared in untracked: %s", u)
+		}
+	}
+
+	err = r.Add([]string{"app.log"})
+	if err == nil {
+		t.Fatalf("expected error adding ignored file without force")
+	}
+
+	err = r.Add([]string{"app.log"}, true)
+	if err != nil {
+		t.Fatalf("force add of ignored file should succeed: %v", err)
+	}
+
+	err = r.Add([]string{"."})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	st, err = r.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stagedPaths []string
+	for _, s := range st.Staged {
+		stagedPaths = append(stagedPaths, s.Path)
+	}
+	for _, p := range stagedPaths {
+		if strings.HasPrefix(p, "secret/") {
+			t.Fatalf("secret directory file was unexpectedly staged: %s", p)
+		}
+	}
+}
+
+func TestRepoDiffTreesRename(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-repo-difftrees-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	r, err := Init(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(tempDir, "file1.txt"), []byte("line1\nline2\nline3\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"file1.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	c1, err := r.Commit("First", "Tester <t@t.com>")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Remove([]string{"file1.txt"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "file2.txt"), []byte("line1\nline2\nline3\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"file2.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := r.Commit("Second", "Tester <t@t.com>")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	commit1, _ := r.LoadCommit(c1)
+	commit2, _ := r.LoadCommit(c2)
+	tree1, _ := r.FlattenTree(commit1.TreeHash, "")
+	tree2, _ := r.FlattenTree(commit2.TreeHash, "")
+
+	diffOut, err := r.DiffTrees(tree1, tree2)
+	if err != nil {
+		t.Fatalf("DiffTrees failed: %v", err)
+	}
+	if !strings.Contains(diffOut, "similarity index 100%") {
+		t.Fatalf("expected rename detection in diff, got: %s", diffOut)
+	}
+	if !strings.Contains(diffOut, "rename from file1.txt") || !strings.Contains(diffOut, "rename to file2.txt") {
+		t.Fatalf("expected rename from/to headers, got: %s", diffOut)
+	}
+}
+
+func TestRepoBinaryMergeConflict(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-repo-binmerge-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	r, err := Init(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	binFile := filepath.Join(tempDir, "image.png")
+	baseBytes := []byte("PNG\x00\x00\x00\rIHDRbase")
+	if err := os.WriteFile(binFile, baseBytes, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"image.png"}); err != nil {
+		t.Fatal(err)
+	}
+	cBase, err := r.Commit("Base image", "Tester <t@t.com>")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.CreateBranch("feature", cBase); err != nil {
+		t.Fatal(err)
+	}
+
+	mainBytes := []byte("PNG\x00\x00\x00\rIHDRmain_version")
+	if err := os.WriteFile(binFile, mainBytes, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"image.png"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Commit("Main edit image", "Tester <t@t.com>"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Checkout("feature"); err != nil {
+		t.Fatal(err)
+	}
+	featBytes := []byte("PNG\x00\x00\x00\rIHDRfeat_version")
+	if err := os.WriteFile(binFile, featBytes, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"image.png"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Commit("Feature edit image", "Tester <t@t.com>"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Checkout("main"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = r.Merge("feature")
+	if err == nil {
+		t.Fatalf("expected binary merge conflict")
+	}
+
+	st, err := r.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Unmerged) != 1 || st.Unmerged[0].Path != "image.png" {
+		t.Fatalf("expected unmerged status for image.png, got: %+v", st.Unmerged)
+	}
+
+	treeContent, err := os.ReadFile(binFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(treeContent, mainBytes) {
+		t.Fatalf("expected working tree to retain main binary content without markers")
+	}
+
+	if err := r.MergeAbort(); err != nil {
+		t.Fatalf("MergeAbort failed: %v", err)
+	}
+
+	stAfter, err := r.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stAfter.Clean {
+		t.Fatalf("expected clean status after merge abort, got: %+v", stAfter)
+	}
+}

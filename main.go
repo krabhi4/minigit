@@ -26,6 +26,8 @@ func main() {
 	switch cmd {
 	case "init":
 		err = handleInit(args)
+	case "clone":
+		err = handleClone(args)
 	case "hash-object":
 		err = handleHashObject(args)
 	case "cat-file":
@@ -71,6 +73,7 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("Available commands:")
 	fmt.Println("   init         Create an empty Git repository")
+	fmt.Println("   clone        Clone a repository into a new directory")
 	fmt.Println("   hash-object  Compute object ID and optionally create an object from a file")
 	fmt.Println("   cat-file     Provide content or type and size information for repository objects")
 	fmt.Println("   add          Add file contents to the index")
@@ -96,6 +99,23 @@ func handleInit(args []string) error {
 		return err
 	}
 	fmt.Printf("Initialized empty Git repository in %s\n", r.GitDir)
+	return nil
+}
+
+func handleClone(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("you must specify a repository to clone")
+	}
+	src := args[0]
+	dst := ""
+	if len(args) > 1 {
+		dst = args[1]
+	}
+	r, err := repo.Clone(src, dst)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Cloning into '%s'...\n", filepath.Base(r.WorkDir))
 	return nil
 }
 
@@ -193,12 +213,26 @@ func handleAdd(args []string) error {
 		return fmt.Errorf("nothing specified, nothing added")
 	}
 
+	force := false
+	var paths []string
+	for _, arg := range args {
+		if arg == "-f" || arg == "--force" {
+			force = true
+		} else {
+			paths = append(paths, arg)
+		}
+	}
+
+	if len(paths) == 0 {
+		return fmt.Errorf("nothing specified, nothing added")
+	}
+
 	r, err := repo.FindRepo(".")
 	if err != nil {
 		return err
 	}
 
-	return r.Add(args)
+	return r.Add(paths, force)
 }
 
 func handleRm(args []string) error {
@@ -470,7 +504,15 @@ func handleDiff(args []string) error {
 		return err
 	}
 
-	d, err := r.Diff(*staged || *cached)
+	rest := fs.Args()
+	var d string
+	if len(rest) >= 2 {
+		d, err = r.DiffCommits(rest[0], rest[1])
+	} else if len(rest) == 1 {
+		d, err = r.DiffCommits(rest[0], "HEAD")
+	} else {
+		d, err = r.Diff(*staged || *cached)
+	}
 	if err != nil {
 		return err
 	}
@@ -599,4 +641,3 @@ func isTTY() bool {
 	}
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
-
