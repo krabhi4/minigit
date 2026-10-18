@@ -1253,3 +1253,562 @@ func TestRevisionResolutionAndCLIDiff(t *testing.T) {
 		t.Fatalf("expected checked out file at v1.0 to have first line, got: %s", string(checkoutData))
 	}
 }
+
+func TestIntegrationStashWorkflow(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-integ-stash-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	binPath, err := filepath.Abs("../minigit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCmd(t, tempDir, binPath, "init")
+
+	f1 := filepath.Join(tempDir, "file1.txt")
+	if err := os.WriteFile(f1, []byte("file1 base\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "file1.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Initial commit")
+
+	if err := os.WriteFile(f1, []byte("file1 staged edit\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "file1.txt")
+
+	f2 := filepath.Join(tempDir, "file2.txt")
+	if err := os.WriteFile(f2, []byte("file2 unstaged content\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "file2.txt")
+	if err := os.WriteFile(f2, []byte("file2 modified in worktree\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stashPushOut := runCmd(t, tempDir, binPath, "stash", "push", "-m", "my feature stash")
+	if !strings.Contains(stashPushOut, "my feature stash") {
+		t.Fatalf("unexpected stash push output: %s", stashPushOut)
+	}
+
+	stOut := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(stOut, "working tree clean") {
+		t.Fatalf("working tree not clean after stash push: %s", stOut)
+	}
+
+	data1, _ := os.ReadFile(f1)
+	if string(data1) != "file1 base\n" {
+		t.Fatalf("file1 not reverted to base: %s", string(data1))
+	}
+
+	fsckOut := runCmd(t, tempDir, "git", "fsck", "--full")
+	if strings.Contains(fsckOut, "error") || strings.Contains(fsckOut, "fatal") || strings.Contains(fsckOut, "corrupt") {
+		t.Fatalf("git fsck failed after minigit stash: %s", fsckOut)
+	}
+
+	catStash := runCmd(t, tempDir, binPath, "cat-file", "-p", "stash")
+	if !strings.Contains(catStash, "parent ") {
+		t.Fatalf("cat-file stash missing parent headers: %s", catStash)
+	}
+	parentCount := strings.Count(catStash, "parent ")
+	if parentCount != 2 {
+		t.Fatalf("stash commit must have exactly 2 parents, found %d in:\n%s", parentCount, catStash)
+	}
+
+	catIndexCommit := runCmd(t, tempDir, binPath, "cat-file", "-p", "stash^2")
+	if strings.Count(catIndexCommit, "parent ") != 1 {
+		t.Fatalf("index commit must have exactly 1 parent in:\n%s", catIndexCommit)
+	}
+
+	gitStashList := runCmd(t, tempDir, "git", "stash", "list")
+	if !strings.Contains(gitStashList, "my feature stash") {
+		t.Fatalf("git stash list did not show stash: %s", gitStashList)
+	}
+
+	stashListOut := runCmd(t, tempDir, binPath, "stash", "list")
+	if !strings.Contains(stashListOut, "stash@{0}: On main: my feature stash") {
+		t.Fatalf("minigit stash list unexpected: %s", stashListOut)
+	}
+
+	if err := os.WriteFile(f1, []byte("file1 second edit\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "file1.txt")
+	runCmd(t, tempDir, binPath, "stash", "push", "-m", "second stash entry")
+
+	list2 := runCmd(t, tempDir, binPath, "stash", "list")
+	if !strings.Contains(list2, "stash@{0}: On main: second stash entry") || !strings.Contains(list2, "stash@{1}: On main: my feature stash") {
+		t.Fatalf("stash list with multiple entries unexpected: %s", list2)
+	}
+
+	runCmd(t, tempDir, binPath, "stash", "drop", "stash@{0}")
+	listAfterDrop := runCmd(t, tempDir, binPath, "stash", "list")
+	if strings.Contains(listAfterDrop, "second stash entry") {
+		t.Fatalf("dropped stash still present: %s", listAfterDrop)
+	}
+	if !strings.Contains(listAfterDrop, "stash@{0}: On main: my feature stash") {
+		t.Fatalf("older stash did not become stash@{0}: %s", listAfterDrop)
+	}
+
+	popOut := runCmd(t, tempDir, binPath, "stash", "pop")
+	if !strings.Contains(popOut, "Dropped stash@{0}") {
+		t.Fatalf("unexpected pop output: %s", popOut)
+	}
+
+	restoredF1, _ := os.ReadFile(f1)
+	if string(restoredF1) != "file1 staged edit\n" {
+		t.Fatalf("file1 not restored: %s", string(restoredF1))
+	}
+	restoredF2, _ := os.ReadFile(f2)
+	if string(restoredF2) != "file2 modified in worktree\n" {
+		t.Fatalf("file2 not restored: %s", string(restoredF2))
+	}
+
+	finalFsck := runCmd(t, tempDir, "git", "fsck", "--full")
+	if strings.Contains(finalFsck, "error") || strings.Contains(finalFsck, "fatal") || strings.Contains(finalFsck, "corrupt") {
+		t.Fatalf("git fsck failed after stash pop: %s", finalFsck)
+	}
+}
+
+func TestIntegrationResetWorkflow(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-integ-reset-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	binPath, err := filepath.Abs("../minigit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCmd(t, tempDir, binPath, "init")
+
+	fA := filepath.Join(tempDir, "fileA.txt")
+	fB := filepath.Join(tempDir, "fileB.txt")
+	if err := os.WriteFile(fA, []byte("A1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fB, []byte("B1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "fileA.txt", "fileB.txt")
+	c1Out := runCmd(t, tempDir, binPath, "commit", "-m", "Commit 1")
+	_ = c1Out
+
+	fC := filepath.Join(tempDir, "fileC.txt")
+	if err := os.WriteFile(fA, []byte("A2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fC, []byte("C1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "fileA.txt", "fileC.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Commit 2")
+
+	fD := filepath.Join(tempDir, "fileD.txt")
+	if err := os.WriteFile(fA, []byte("A3\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fD, []byte("D1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "fileA.txt", "fileD.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Commit 3")
+
+	runCmd(t, tempDir, binPath, "reset", "--soft", "HEAD~1")
+	stSoft := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(stSoft, "Changes to be committed") || !strings.Contains(stSoft, "fileD.txt") {
+		t.Fatalf("expected staged files after reset --soft: %s", stSoft)
+	}
+
+	fsckSoft := runCmd(t, tempDir, "git", "fsck", "--full")
+	if strings.Contains(fsckSoft, "error") || strings.Contains(fsckSoft, "fatal") || strings.Contains(fsckSoft, "corrupt") {
+		t.Fatalf("git fsck failed after reset --soft: %s", fsckSoft)
+	}
+
+	runCmd(t, tempDir, binPath, "reset", "--mixed", "HEAD")
+	stMixed := runCmd(t, tempDir, binPath, "status")
+	if strings.Contains(stMixed, "Changes to be committed") {
+		t.Fatalf("expected no staged changes after mixed reset: %s", stMixed)
+	}
+	if !strings.Contains(stMixed, "Changes not staged for commit") && !strings.Contains(stMixed, "Untracked files") {
+		t.Fatalf("expected unstaged/untracked changes after mixed reset: %s", stMixed)
+	}
+
+	fsckMixed := runCmd(t, tempDir, "git", "fsck", "--full")
+	if strings.Contains(fsckMixed, "error") || strings.Contains(fsckMixed, "fatal") || strings.Contains(fsckMixed, "corrupt") {
+		t.Fatalf("git fsck failed after reset --mixed: %s", fsckMixed)
+	}
+
+	runCmd(t, tempDir, binPath, "reset", "--hard", "HEAD")
+
+	hardOut := runCmd(t, tempDir, binPath, "reset", "--hard", "HEAD~1")
+	if !strings.Contains(hardOut, "HEAD is now at") {
+		t.Fatalf("unexpected reset --hard output: %s", hardOut)
+	}
+
+	dataA, _ := os.ReadFile(fA)
+	if string(dataA) != "A1\n" {
+		t.Fatalf("fileA not reverted to A1: %s", string(dataA))
+	}
+	if _, err := os.Stat(fC); !os.IsNotExist(err) {
+		t.Fatalf("fileC should have been removed: %v", err)
+	}
+
+	fsckHard := runCmd(t, tempDir, "git", "fsck", "--full")
+	if strings.Contains(fsckHard, "error") || strings.Contains(fsckHard, "fatal") || strings.Contains(fsckHard, "corrupt") {
+		t.Fatalf("git fsck failed after reset --hard: %s", fsckHard)
+	}
+}
+
+func TestIntegrationCherryPickWorkflow(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-integ-cp-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	binPath, err := filepath.Abs("../minigit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCmd(t, tempDir, binPath, "init")
+
+	commonPath := filepath.Join(tempDir, "common.txt")
+	if err := os.WriteFile(commonPath, []byte("common line\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "common.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Initial common commit")
+
+	runCmd(t, tempDir, binPath, "branch", "feat-add")
+	runCmd(t, tempDir, binPath, "checkout", "feat-add")
+
+	newFilePath := filepath.Join(tempDir, "standalone.txt")
+	if err := os.WriteFile(newFilePath, []byte("standalone feature content\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "standalone.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Add standalone feature")
+
+	runCmd(t, tempDir, binPath, "checkout", "main")
+	if err := os.WriteFile(commonPath, []byte("common line\nmain extra line\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "common.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Update common on main")
+
+	cpOut := runCmd(t, tempDir, binPath, "cherry-pick", "feat-add")
+	if !strings.Contains(cpOut, "Add standalone feature") {
+		t.Fatalf("unexpected cherry-pick output: %s", cpOut)
+	}
+
+	contentStandalone, err := os.ReadFile(newFilePath)
+	if err != nil {
+		t.Fatalf("standalone.txt missing after cherry-pick: %v", err)
+	}
+	if string(contentStandalone) != "standalone feature content\n" {
+		t.Fatalf("standalone.txt content mismatch: %s", string(contentStandalone))
+	}
+
+	contentCommon, err := os.ReadFile(commonPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contentCommon) != "common line\nmain extra line\n" {
+		t.Fatalf("common.txt corrupted after cherry-pick: %s", string(contentCommon))
+	}
+
+	fsckCp := runCmd(t, tempDir, "git", "fsck", "--full")
+	if strings.Contains(fsckCp, "error") || strings.Contains(fsckCp, "fatal") || strings.Contains(fsckCp, "corrupt") {
+		t.Fatalf("git fsck failed after clean cherry-pick: %s", fsckCp)
+	}
+
+	runCmd(t, tempDir, binPath, "branch", "feat-conflict", "HEAD~2")
+	runCmd(t, tempDir, binPath, "checkout", "feat-conflict")
+	if err := os.WriteFile(commonPath, []byte("common line\nconflicting feature line\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "common.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Conflicting feature update")
+
+	runCmd(t, tempDir, binPath, "checkout", "main")
+
+	cpCmd := exec.Command(binPath, "cherry-pick", "feat-conflict")
+	cpCmd.Dir = tempDir
+	cpConflictOut, _ := cpCmd.CombinedOutput()
+	if !strings.Contains(string(cpConflictOut), "could not apply") {
+		t.Fatalf("expected cherry-pick conflict error, got: %s", string(cpConflictOut))
+	}
+
+	stCp := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(stCp, "cherry-picking") || !strings.Contains(stCp, "Unmerged paths") {
+		t.Fatalf("status did not show cherry-pick conflict: %s", stCp)
+	}
+
+	runCmd(t, tempDir, binPath, "cherry-pick", "--abort")
+	stAborted := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(stAborted, "working tree clean") {
+		t.Fatalf("status not clean after cherry-pick --abort: %s", stAborted)
+	}
+
+	cpCmd2 := exec.Command(binPath, "cherry-pick", "feat-conflict")
+	cpCmd2.Dir = tempDir
+	_, _ = cpCmd2.CombinedOutput()
+
+	if err := os.WriteFile(commonPath, []byte("common line\nresolved both lines\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "common.txt")
+
+	commitResolveOut := runCmd(t, tempDir, binPath, "commit")
+	if !strings.Contains(commitResolveOut, "Conflicting feature update") {
+		t.Fatalf("resolved cherry-pick commit missing original message: %s", commitResolveOut)
+	}
+
+	finalFsck := runCmd(t, tempDir, "git", "fsck", "--full")
+	if strings.Contains(finalFsck, "error") || strings.Contains(finalFsck, "fatal") || strings.Contains(finalFsck, "corrupt") {
+		t.Fatalf("git fsck failed after resolved cherry-pick: %s", finalFsck)
+	}
+}
+
+func TestIntegrationStashIndexAndUnstagedPop(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-integ-stash-idx-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	binPath, err := filepath.Abs("../minigit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCmd(t, tempDir, binPath, "init")
+
+	f1 := filepath.Join(tempDir, "f1.txt")
+	f2 := filepath.Join(tempDir, "f2.txt")
+	if err := os.WriteFile(f1, []byte("1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f2, []byte("2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "f1.txt", "f2.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Init")
+
+	if err := os.WriteFile(f1, []byte("1 unstaged\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "stash")
+	stAfterStash := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(stAfterStash, "working tree clean") {
+		t.Fatalf("expected clean after stash, got: %s", stAfterStash)
+	}
+
+	runCmd(t, tempDir, binPath, "stash", "pop")
+	stAfterPop := runCmd(t, tempDir, binPath, "status")
+	if strings.Contains(stAfterPop, "Changes to be committed") {
+		t.Fatalf("default stash pop should not stage changes: %s", stAfterPop)
+	}
+	if !strings.Contains(stAfterPop, "Changes not staged for commit") || !strings.Contains(stAfterPop, "f1.txt") {
+		t.Fatalf("expected f1.txt unstaged after default stash pop: %s", stAfterPop)
+	}
+
+	if err := os.WriteFile(f1, []byte("1 staged\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "f1.txt")
+	if err := os.WriteFile(f2, []byte("2 unstaged\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "stash")
+
+	runCmd(t, tempDir, binPath, "stash", "pop", "--index")
+	stAfterIndexPop := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(stAfterIndexPop, "Changes to be committed") || !strings.Contains(stAfterIndexPop, "f1.txt") {
+		t.Fatalf("expected f1.txt staged after stash pop --index: %s", stAfterIndexPop)
+	}
+	if !strings.Contains(stAfterIndexPop, "Changes not staged for commit") || !strings.Contains(stAfterIndexPop, "f2.txt") {
+		t.Fatalf("expected f2.txt unstaged after stash pop --index: %s", stAfterIndexPop)
+	}
+
+	fsckOut := runCmd(t, tempDir, "git", "fsck", "--full")
+	if strings.Contains(fsckOut, "error") || strings.Contains(fsckOut, "fatal") || strings.Contains(fsckOut, "corrupt") {
+		t.Fatalf("git fsck failed: %s", fsckOut)
+	}
+}
+
+func TestIntegrationResetPathsAndUnborn(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-integ-reset-paths-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	binPath, err := filepath.Abs("../minigit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCmd(t, tempDir, binPath, "init")
+
+	fA := filepath.Join(tempDir, "a.txt")
+	if err := os.WriteFile(fA, []byte("hello\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "a.txt")
+	stUnbornPre := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(stUnbornPre, "new file:   a.txt") {
+		t.Fatalf("expected a.txt staged on unborn branch")
+	}
+
+	runCmd(t, tempDir, binPath, "reset")
+	stUnbornPost := runCmd(t, tempDir, binPath, "status")
+	if strings.Contains(stUnbornPost, "Changes to be committed") {
+		t.Fatalf("expected no staged changes after reset on unborn branch")
+	}
+	if !strings.Contains(stUnbornPost, "Untracked files") || !strings.Contains(stUnbornPost, "a.txt") {
+		t.Fatalf("expected a.txt untracked after reset on unborn branch")
+	}
+
+	runCmd(t, tempDir, binPath, "add", "a.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "C1")
+
+	fB := filepath.Join(tempDir, "b.txt")
+	if err := os.WriteFile(fA, []byte("hello mod\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fB, []byte("b mod\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "a.txt", "b.txt")
+
+	stBothStaged := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(stBothStaged, "a.txt") || !strings.Contains(stBothStaged, "b.txt") {
+		t.Fatalf("expected both staged: %s", stBothStaged)
+	}
+
+	runCmd(t, tempDir, binPath, "reset", "a.txt")
+	stAfterPathReset := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(stAfterPathReset, "Changes to be committed") || !strings.Contains(stAfterPathReset, "b.txt") {
+		t.Fatalf("expected b.txt still staged: %s", stAfterPathReset)
+	}
+	if !strings.Contains(stAfterPathReset, "Changes not staged for commit") || !strings.Contains(stAfterPathReset, "a.txt") {
+		t.Fatalf("expected a.txt unstaged: %s", stAfterPathReset)
+	}
+
+	fsckOut := runCmd(t, tempDir, "git", "fsck", "--full")
+	if strings.Contains(fsckOut, "error") || strings.Contains(fsckOut, "fatal") || strings.Contains(fsckOut, "corrupt") {
+		t.Fatalf("git fsck failed: %s", fsckOut)
+	}
+}
+
+func TestIntegrationCherryPickMainlineAndContinue(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-integ-cp-more-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	binPath, err := filepath.Abs("../minigit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCmd(t, tempDir, binPath, "init")
+
+	f1 := filepath.Join(tempDir, "f1.txt")
+	if err := os.WriteFile(f1, []byte("f1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "f1.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "C1")
+
+	runCmd(t, tempDir, binPath, "branch", "side")
+	runCmd(t, tempDir, binPath, "checkout", "side")
+	f2 := filepath.Join(tempDir, "f2.txt")
+	if err := os.WriteFile(f2, []byte("f2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "f2.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "C_side")
+
+	runCmd(t, tempDir, binPath, "checkout", "main")
+	f3 := filepath.Join(tempDir, "f3.txt")
+	if err := os.WriteFile(f3, []byte("f3\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "f3.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "C_main")
+
+	runCmd(t, tempDir, binPath, "merge", "side")
+	mergeHash := strings.TrimSpace(runCmd(t, tempDir, "git", "rev-parse", "HEAD"))
+
+	runCmd(t, tempDir, binPath, "branch", "target-branch", "HEAD~2")
+	runCmd(t, tempDir, binPath, "checkout", "target-branch")
+
+	mergeNoMCmd := exec.Command(binPath, "cherry-pick", mergeHash)
+	mergeNoMCmd.Dir = tempDir
+	noMOut, _ := mergeNoMCmd.CombinedOutput()
+	if !strings.Contains(string(noMOut), "is a merge but no -m option was given") {
+		t.Fatalf("expected error without -m, got: %s", string(noMOut))
+	}
+
+	runCmd(t, tempDir, binPath, "cherry-pick", "-m", "1", mergeHash)
+
+	if _, err := os.Stat(f2); err != nil {
+		t.Fatalf("f2.txt missing after cherry-pick -m 1: %v", err)
+	}
+
+	conflictFile := filepath.Join(tempDir, "conflict.txt")
+	if err := os.WriteFile(conflictFile, []byte("line 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "conflict.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Add conflict base")
+
+	runCmd(t, tempDir, binPath, "branch", "conflict-side")
+	runCmd(t, tempDir, binPath, "checkout", "conflict-side")
+	if err := os.WriteFile(conflictFile, []byte("line 1\nside conflict line\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "conflict.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Side conflict commit")
+
+	runCmd(t, tempDir, binPath, "checkout", "target-branch")
+	if err := os.WriteFile(conflictFile, []byte("line 1\nmain conflict line\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "conflict.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Main conflict commit")
+
+	cpConflictCmd := exec.Command(binPath, "cherry-pick", "conflict-side")
+	cpConflictCmd.Dir = tempDir
+	_, _ = cpConflictCmd.CombinedOutput()
+
+	if err := os.WriteFile(conflictFile, []byte("line 1\nresolved conflict line\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "conflict.txt")
+
+	contOut := runCmd(t, tempDir, binPath, "cherry-pick", "--continue")
+	if !strings.Contains(contOut, "Side conflict commit") {
+		t.Fatalf("unexpected cherry-pick --continue output: %s", contOut)
+	}
+
+	stFinal := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(stFinal, "working tree clean") {
+		t.Fatalf("expected clean status after --continue: %s", stFinal)
+	}
+
+	fsckOut := runCmd(t, tempDir, "git", "fsck", "--full")
+	if strings.Contains(fsckOut, "error") || strings.Contains(fsckOut, "fatal") || strings.Contains(fsckOut, "corrupt") {
+		t.Fatalf("git fsck failed: %s", fsckOut)
+	}
+}

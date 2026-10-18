@@ -131,10 +131,10 @@ func (c *Commit) Serialize() []byte {
 	}
 
 	_, authorOffset := authorTime.Zone()
-	authorTZ := formatTimezone(authorOffset)
+	authorTZ := FormatTimezone(authorOffset)
 
 	_, committerOffset := committerTime.Zone()
-	committerTZ := formatTimezone(committerOffset)
+	committerTZ := FormatTimezone(committerOffset)
 
 	buf.WriteString(fmt.Sprintf("author %s %d %s\n", c.Author, authorTime.Unix(), authorTZ))
 	buf.WriteString(fmt.Sprintf("committer %s %d %s\n", c.Committer, committerTime.Unix(), committerTZ))
@@ -179,7 +179,7 @@ func ParseCommit(data []byte) (*Commit, error) {
 	return c, nil
 }
 
-func formatTimezone(offsetSeconds int) string {
+func FormatTimezone(offsetSeconds int) string {
 	sign := "+"
 	if offsetSeconds < 0 {
 		sign = "-"

@@ -112,6 +112,9 @@ go build -o minigit .
 | `branch` | `minigit branch [-d <name>] [<name>] [<start-point>]` | List, create, or delete branches |
 | `checkout` | `minigit checkout <branch-or-commit>` | Switch branches or checkout specific revisions |
 | `merge` | `minigit merge [--abort] <branch-or-commit>` | Merge target branch into current branch |
+| `cherry-pick` | `minigit cherry-pick [--continue\|--abort] [-m <parent>] <commit>` | Apply changes introduced by existing commit |
+| `reset` | `minigit reset [--soft\|--mixed\|--hard] [<rev>] [<path>...]` | Reset current HEAD or unstage specified paths |
+| `stash` | `minigit stash [push\|pop\|apply\|list\|drop] [--index] [-m <msg>]` | Stash changes in dirty working directory |
 | `tag` | `minigit tag [-d <name>] [<name>] [<target>]` | List, create, or delete lightweight/annotated tags |
 | `hash-object` | `minigit hash-object [-w] [-t <type>] <file>` | Compute object ID and optionally store object |
 | `cat-file` | `minigit cat-file (-p\|-t\|-s) <object>` | Inspect object contents, type, or byte size |

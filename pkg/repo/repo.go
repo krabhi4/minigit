@@ -292,48 +292,75 @@ func (r *Repository) ResolveRevision(rev string) (string, error) {
 		return "", errors.New("empty revision")
 	}
 
-	if idx := strings.Index(rev, "~"); idx != -1 {
-		baseRev := rev[:idx]
-		nStr := rev[idx+1:]
-		n := 1
-		if nStr != "" {
-			var err error
-			n, err = strconv.Atoi(nStr)
-			if err != nil {
-				return "", fmt.Errorf("invalid revision: %s", rev)
-			}
-		}
-		hash, err := r.ResolveRevision(baseRev)
-		if err != nil {
-			return "", err
-		}
-		for i := 0; i < n; i++ {
-			c, err := r.LoadCommit(hash)
-			if err != nil {
-				return "", err
-			}
-			if len(c.ParentHashes) == 0 {
-				return "", fmt.Errorf("revision %s has no parent %d", rev, i+1)
-			}
-			hash = c.ParentHashes[0]
-		}
-		return hash, nil
+	lastTilde := strings.LastIndex(rev, "~")
+	lastCaret := strings.LastIndex(rev, "^")
+	splitIdx := lastTilde
+	isCaret := false
+	if lastCaret > splitIdx {
+		splitIdx = lastCaret
+		isCaret = true
 	}
 
-	if strings.HasSuffix(rev, "^") {
-		baseRev := strings.TrimSuffix(rev, "^")
-		hash, err := r.ResolveRevision(baseRev)
-		if err != nil {
-			return "", err
+	if splitIdx > 0 {
+		baseRev := rev[:splitIdx]
+		nStr := rev[splitIdx+1:]
+		valid := true
+		for _, ch := range nStr {
+			if ch < '0' || ch > '9' {
+				valid = false
+				break
+			}
 		}
-		c, err := r.LoadCommit(hash)
-		if err != nil {
-			return "", err
+		if valid {
+			if !isCaret {
+				n := 1
+				if nStr != "" {
+					var err error
+					n, err = strconv.Atoi(nStr)
+					if err != nil {
+						return "", fmt.Errorf("invalid revision: %s", rev)
+					}
+				}
+				hash, err := r.ResolveRevision(baseRev)
+				if err != nil {
+					return "", err
+				}
+				for i := 0; i < n; i++ {
+					c, err := r.LoadCommit(hash)
+					if err != nil {
+						return "", err
+					}
+					if len(c.ParentHashes) == 0 {
+						return "", fmt.Errorf("revision %s has no parent %d", rev, i+1)
+					}
+					hash = c.ParentHashes[0]
+				}
+				return hash, nil
+			} else {
+				parentNum := 1
+				if nStr != "" {
+					var err error
+					parentNum, err = strconv.Atoi(nStr)
+					if err != nil {
+						return "", fmt.Errorf("invalid revision: %s", rev)
+					}
+				}
+				if parentNum > 0 {
+					hash, err := r.ResolveRevision(baseRev)
+					if err != nil {
+						return "", err
+					}
+					c, err := r.LoadCommit(hash)
+					if err != nil {
+						return "", err
+					}
+					if len(c.ParentHashes) < parentNum {
+						return "", fmt.Errorf("revision %s has no parent %d", rev, parentNum)
+					}
+					return c.ParentHashes[parentNum-1], nil
+				}
+			}
 		}
-		if len(c.ParentHashes) == 0 {
-			return "", fmt.Errorf("revision %s has no parent", rev)
-		}
-		return c.ParentHashes[0], nil
 	}
 
 	if rev == "HEAD" {
@@ -345,6 +372,46 @@ func (r *Repository) ResolveRevision(rev string) (string, error) {
 			return "", errors.New("HEAD does not point to any commit")
 		}
 		return headHash, nil
+	}
+
+	if rev == "stash" {
+		stashPath := filepath.Join(r.GitDir, "refs", "stash")
+		if data, err := os.ReadFile(stashPath); err == nil {
+			return strings.TrimSpace(string(data)), nil
+		}
+		packed, err := r.ReadPackedRefs()
+		if err == nil {
+			if h, ok := packed["refs/stash"]; ok {
+				return h, nil
+			}
+		}
+		return "", errors.New("revision 'stash' not found")
+	}
+
+	lookupStash := strings.TrimPrefix(rev, "refs/")
+	if strings.HasPrefix(lookupStash, "stash@{") && strings.HasSuffix(lookupStash, "}") {
+		nStr := lookupStash[len("stash@{") : len(lookupStash)-1]
+		n, err := strconv.Atoi(nStr)
+		if err == nil {
+			logFile := filepath.Join(r.GitDir, "logs", "refs", "stash")
+			if data, err := os.ReadFile(logFile); err == nil {
+				lines := parseNonEmptyLines(string(data))
+				if n >= 0 && n < len(lines) {
+					targetLine := lines[len(lines)-1-n]
+					fields := strings.Fields(targetLine)
+					if len(fields) >= 2 {
+						return fields[1], nil
+					}
+				}
+			}
+			if n == 0 {
+				stashPath := filepath.Join(r.GitDir, "refs", "stash")
+				if data, err := os.ReadFile(stashPath); err == nil {
+					return strings.TrimSpace(string(data)), nil
+				}
+			}
+		}
+		return "", fmt.Errorf("revision '%s' not found", rev)
 	}
 
 	if strings.HasPrefix(rev, "refs/") {
@@ -802,25 +869,31 @@ func (r *Repository) Commit(message string, author string) (string, error) {
 		parentHashes = append(parentHashes, mergeParentHash)
 	}
 
-	if author == "" {
-		author = os.Getenv("GIT_AUTHOR_NAME")
-		email := os.Getenv("GIT_AUTHOR_EMAIL")
-		if author == "" {
-			author = "minigit author"
+	now := time.Now()
+	committer := r.defaultAuthor()
+	authorTime := now
+
+	cpHeadPath := filepath.Join(r.GitDir, "CHERRY_PICK_HEAD")
+	if cpHeadData, err := os.ReadFile(cpHeadPath); err == nil {
+		cpHash := strings.TrimSpace(string(cpHeadData))
+		if cpCommit, err := r.LoadCommit(cpHash); err == nil {
+			if author == "" {
+				author = cpCommit.Author
+				authorTime = cpCommit.AuthorTime
+			}
 		}
-		if email == "" {
-			email = "author@minigit.local"
-		}
-		author = fmt.Sprintf("%s <%s>", author, email)
 	}
 
-	now := time.Now()
+	if author == "" {
+		author = committer
+	}
+
 	commitObj := &object.Commit{
 		TreeHash:      treeHash,
 		ParentHashes:  parentHashes,
 		Author:        author,
-		AuthorTime:    now,
-		Committer:     author,
+		AuthorTime:    authorTime,
+		Committer:     committer,
 		CommitterTime: now,
 		Message:       message,
 	}
@@ -845,6 +918,7 @@ func (r *Repository) Commit(message string, author string) (string, error) {
 		_ = os.Remove(filepath.Join(r.GitDir, "MERGE_MSG"))
 		_ = os.Remove(filepath.Join(r.GitDir, "MERGE_MODE"))
 	}
+	_ = os.Remove(filepath.Join(r.GitDir, "CHERRY_PICK_HEAD"))
 
 	return commitHash, nil
 }
@@ -927,15 +1001,16 @@ type FileStatus struct {
 }
 
 type RepoStatus struct {
-	Branch     string
-	IsDetached bool
-	HEADHash   string
-	IsMerging  bool
-	Staged     []FileStatus
-	Unstaged   []FileStatus
-	Untracked  []string
-	Unmerged   []FileStatus
-	Clean      bool
+	Branch          string
+	IsDetached      bool
+	HEADHash        string
+	IsMerging       bool
+	IsCherryPicking bool
+	Staged          []FileStatus
+	Unstaged        []FileStatus
+	Untracked       []string
+	Unmerged        []FileStatus
+	Clean           bool
 }
 
 func (r *Repository) Status() (*RepoStatus, error) {
@@ -952,6 +1027,9 @@ func (r *Repository) Status() (*RepoStatus, error) {
 
 	if _, err := os.Stat(filepath.Join(r.GitDir, "MERGE_HEAD")); err == nil {
 		res.IsMerging = true
+	}
+	if _, err := os.Stat(filepath.Join(r.GitDir, "CHERRY_PICK_HEAD")); err == nil {
+		res.IsCherryPicking = true
 	}
 
 	var headFiles map[string]FlattenedFile
@@ -1103,7 +1181,7 @@ func (r *Repository) Status() (*RepoStatus, error) {
 	sort.Slice(res.Unmerged, func(i, j int) bool { return res.Unmerged[i].Path < res.Unmerged[j].Path })
 	sort.Strings(res.Untracked)
 
-	res.Clean = len(res.Staged) == 0 && len(res.Unstaged) == 0 && len(res.Untracked) == 0 && len(res.Unmerged) == 0 && !res.IsMerging
+	res.Clean = len(res.Staged) == 0 && len(res.Unstaged) == 0 && len(res.Untracked) == 0 && len(res.Unmerged) == 0 && !res.IsMerging && !res.IsCherryPicking
 	return res, nil
 }
 
@@ -1684,191 +1762,25 @@ func (r *Repository) Merge(target string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-
-	allPathsMap := make(map[string]bool)
+	incomingChanges := make(map[string]bool)
+	for p, fTheirs := range theirFiles {
+		fBase, inBase := baseFiles[p]
+		if !inBase || fBase.Hash != fTheirs.Hash {
+			incomingChanges[p] = true
+		}
+	}
 	for p := range baseFiles {
-		allPathsMap[p] = true
+		if _, inTheirs := theirFiles[p]; !inTheirs {
+			incomingChanges[p] = true
+		}
 	}
-	for p := range ourFiles {
-		allPathsMap[p] = true
-	}
-	for p := range theirFiles {
-		allPathsMap[p] = true
-	}
-
-	var allPaths []string
-	for p := range allPathsMap {
-		allPaths = append(allPaths, p)
-	}
-	sort.Strings(allPaths)
-
-	idx, err := r.LoadIndex()
-	if err != nil {
+	if err := r.checkWorktreeDirty(incomingChanges, "merge"); err != nil {
 		return "", err
 	}
 
-	hasConflict := false
-
-	for _, p := range allPaths {
-		fBase, inBase := baseFiles[p]
-		fOurs, inOurs := ourFiles[p]
-		fTheirs, inTheirs := theirFiles[p]
-
-		filePath := filepath.Join(r.WorkDir, filepath.FromSlash(p))
-
-		if !inBase && inOurs && !inTheirs {
-			continue
-		}
-		if !inBase && !inOurs && inTheirs {
-			_, data, _, err := object.ReadObject(r.GitDir, fTheirs.Hash)
-			if err != nil {
-				return "", err
-			}
-			if err := r.writeFileToWorkDir(filePath, fTheirs.Mode, data); err != nil {
-				return "", err
-			}
-			hBytes, _ := hex.DecodeString(fTheirs.Hash)
-			var sha [20]byte
-			copy(sha[:], hBytes)
-			m := uint32(0100644)
-			if fTheirs.Mode == "100755" {
-				m = 0100755
-			} else if fTheirs.Mode == "120000" {
-				m = 0120000
-			}
-			idx.AddOrUpdate(index.IndexEntry{Mode: m, FileSize: uint32(len(data)), Sha1: sha, Path: p})
-			continue
-		}
-		if inBase && !inOurs && inTheirs {
-			if fBase.Hash == fTheirs.Hash {
-				continue
-			}
-			hasConflict = true
-			idx.Remove(p)
-			_, baseData, _, _ := object.ReadObject(r.GitDir, fBase.Hash)
-			_, theirData, _, _ := object.ReadObject(r.GitDir, fTheirs.Hash)
-			idx.AddOrUpdate(createStageEntry(p, 1, fBase.Mode, fBase.Hash, len(baseData)))
-			idx.AddOrUpdate(createStageEntry(p, 3, fTheirs.Mode, fTheirs.Hash, len(theirData)))
-			_ = r.writeFileToWorkDir(filePath, fTheirs.Mode, theirData)
-			continue
-		}
-		if inBase && inOurs && !inTheirs {
-			if fBase.Hash == fOurs.Hash {
-				_ = os.Remove(filePath)
-				cleanEmptyDirs(filepath.Dir(filePath), r.WorkDir)
-				idx.Remove(p)
-				continue
-			}
-			hasConflict = true
-			idx.Remove(p)
-			_, baseData, _, _ := object.ReadObject(r.GitDir, fBase.Hash)
-			_, ourData, _, _ := object.ReadObject(r.GitDir, fOurs.Hash)
-			idx.AddOrUpdate(createStageEntry(p, 1, fBase.Mode, fBase.Hash, len(baseData)))
-			idx.AddOrUpdate(createStageEntry(p, 2, fOurs.Mode, fOurs.Hash, len(ourData)))
-			_ = r.writeFileToWorkDir(filePath, fOurs.Mode, ourData)
-			continue
-		}
-		if inOurs && inTheirs && fOurs.Hash == fTheirs.Hash {
-			continue
-		}
-		if inBase && inOurs && inTheirs {
-			if fOurs.Hash == fBase.Hash && fTheirs.Hash != fBase.Hash {
-				_, data, _, err := object.ReadObject(r.GitDir, fTheirs.Hash)
-				if err != nil {
-					return "", err
-				}
-				if err := r.writeFileToWorkDir(filePath, fTheirs.Mode, data); err != nil {
-					return "", err
-				}
-				hBytes, _ := hex.DecodeString(fTheirs.Hash)
-				var sha [20]byte
-				copy(sha[:], hBytes)
-				m := uint32(0100644)
-				if fTheirs.Mode == "100755" {
-					m = 0100755
-				} else if fTheirs.Mode == "120000" {
-					m = 0120000
-				}
-				idx.AddOrUpdate(index.IndexEntry{Mode: m, FileSize: uint32(len(data)), Sha1: sha, Path: p})
-				continue
-			}
-			if fTheirs.Hash == fBase.Hash && fOurs.Hash != fBase.Hash {
-				continue
-			}
-		}
-
-		var baseData, ourData, theirData []byte
-		if inBase {
-			_, baseData, _, _ = object.ReadObject(r.GitDir, fBase.Hash)
-		}
-		if inOurs {
-			_, ourData, _, _ = object.ReadObject(r.GitDir, fOurs.Hash)
-		}
-		if inTheirs {
-			_, theirData, _, _ = object.ReadObject(r.GitDir, fTheirs.Hash)
-		}
-
-		if diff.IsBinary(baseData) || diff.IsBinary(ourData) || diff.IsBinary(theirData) {
-			hasConflict = true
-			idx.Remove(p)
-			if inBase {
-				idx.AddOrUpdate(createStageEntry(p, 1, fBase.Mode, fBase.Hash, len(baseData)))
-			}
-			if inOurs {
-				idx.AddOrUpdate(createStageEntry(p, 2, fOurs.Mode, fOurs.Hash, len(ourData)))
-				_ = r.writeFileToWorkDir(filePath, fOurs.Mode, ourData)
-			}
-			if inTheirs {
-				idx.AddOrUpdate(createStageEntry(p, 3, fTheirs.Mode, fTheirs.Hash, len(theirData)))
-				if !inOurs {
-					_ = r.writeFileToWorkDir(filePath, fTheirs.Mode, theirData)
-				}
-			}
-			continue
-		}
-
-		mergedContent, fileConflict := diff.Merge3(string(baseData), string(ourData), string(theirData), target)
-		mode := fOurs.Mode
-		if mode == "" {
-			mode = fTheirs.Mode
-		}
-		if err := r.writeFileToWorkDir(filePath, mode, []byte(mergedContent)); err != nil {
-			return "", err
-		}
-
-		if fileConflict {
-			hasConflict = true
-			idx.Remove(p)
-			if inBase {
-				idx.AddOrUpdate(createStageEntry(p, 1, fBase.Mode, fBase.Hash, len(baseData)))
-			}
-			if inOurs {
-				idx.AddOrUpdate(createStageEntry(p, 2, fOurs.Mode, fOurs.Hash, len(ourData)))
-			}
-			if inTheirs {
-				idx.AddOrUpdate(createStageEntry(p, 3, fTheirs.Mode, fTheirs.Hash, len(theirData)))
-			}
-		} else {
-			blobHash, err := object.WriteObject(r.GitDir, object.TypeBlob, []byte(mergedContent))
-			if err != nil {
-				return "", err
-			}
-			hBytes, _ := hex.DecodeString(blobHash)
-			var sha [20]byte
-			copy(sha[:], hBytes)
-			m := uint32(0100644)
-			if mode == "100755" || mode == "0100755" {
-				m = 0100755
-			} else if mode == "120000" || mode == "0120000" {
-				m = 0120000
-			}
-			idx.AddOrUpdate(index.IndexEntry{
-				Mode:     m,
-				FileSize: uint32(len(mergedContent)),
-				Sha1:     sha,
-				Path:     p,
-			})
-		}
+	idx, hasConflict, err := r.mergeTrees3Way(baseFiles, ourFiles, theirFiles, target)
+	if err != nil {
+		return "", err
 	}
 
 	if hasConflict {
@@ -1887,15 +1799,7 @@ func (r *Repository) Merge(target string) (string, error) {
 		return "", err
 	}
 
-	author := os.Getenv("GIT_AUTHOR_NAME")
-	email := os.Getenv("GIT_AUTHOR_EMAIL")
-	if author == "" {
-		author = "minigit author"
-	}
-	if email == "" {
-		email = "author@minigit.local"
-	}
-	authorStr := fmt.Sprintf("%s <%s>", author, email)
+	authorStr := r.defaultAuthor()
 	now := time.Now()
 
 	commitObj := &object.Commit{
@@ -1945,52 +1849,7 @@ func (r *Repository) MergeAbort() error {
 		return err
 	}
 
-	headFiles, err := r.FlattenTree(headCommit.TreeHash, "")
-	if err != nil {
-		return err
-	}
-
-	idx, err := r.LoadIndex()
-	if err != nil {
-		return err
-	}
-
-	for _, entry := range idx.Entries {
-		filePath := filepath.Join(r.WorkDir, filepath.FromSlash(entry.Path))
-		if _, inHead := headFiles[entry.Path]; !inHead {
-			_ = os.Remove(filePath)
-			cleanEmptyDirs(filepath.Dir(filePath), r.WorkDir)
-		}
-	}
-
-	newIdx := &index.Index{}
-	for p, f := range headFiles {
-		filePath := filepath.Join(r.WorkDir, filepath.FromSlash(p))
-		_, data, _, err := object.ReadObject(r.GitDir, f.Hash)
-		if err != nil {
-			return err
-		}
-		if err := r.writeFileToWorkDir(filePath, f.Mode, data); err != nil {
-			return err
-		}
-		hBytes, _ := hex.DecodeString(f.Hash)
-		var sha [20]byte
-		copy(sha[:], hBytes)
-		m := uint32(0100644)
-		if f.Mode == "100755" || f.Mode == "0100755" {
-			m = 0100755
-		} else if f.Mode == "120000" || f.Mode == "0120000" {
-			m = 0120000
-		}
-		newIdx.AddOrUpdate(index.IndexEntry{
-			Mode:     m,
-			FileSize: uint32(len(data)),
-			Sha1:     sha,
-			Path:     p,
-		})
-	}
-
-	if err := r.SaveIndex(newIdx); err != nil {
+	if err := r.resetTree(headCommit.TreeHash, true); err != nil {
 		return err
 	}
 
@@ -2091,4 +1950,313 @@ func createStageEntry(path string, stage int, mode string, hash string, size int
 		Flags:    flags,
 		Path:     path,
 	}
+}
+
+func (r *Repository) defaultAuthor() string {
+	author := os.Getenv("GIT_AUTHOR_NAME")
+	email := os.Getenv("GIT_AUTHOR_EMAIL")
+	if author == "" {
+		author = "minigit author"
+	}
+	if email == "" {
+		email = "author@minigit.local"
+	}
+	return fmt.Sprintf("%s <%s>", author, email)
+}
+
+func (r *Repository) resetTree(targetTreeHash string, resetWorkDir bool) error {
+	targetFiles, err := r.FlattenTree(targetTreeHash, "")
+	if err != nil {
+		return err
+	}
+
+	if resetWorkDir {
+		idx, _ := r.LoadIndex()
+		if idx != nil {
+			for _, entry := range idx.Entries {
+				if _, inTarget := targetFiles[entry.Path]; !inTarget {
+					filePath := filepath.Join(r.WorkDir, filepath.FromSlash(entry.Path))
+					_ = os.Remove(filePath)
+					cleanEmptyDirs(filepath.Dir(filePath), r.WorkDir)
+				}
+			}
+		}
+	}
+
+	newIdx := &index.Index{}
+	for p, f := range targetFiles {
+		filePath := filepath.Join(r.WorkDir, filepath.FromSlash(p))
+		_, data, _, err := object.ReadObject(r.GitDir, f.Hash)
+		if err != nil {
+			return err
+		}
+
+		if resetWorkDir {
+			if err := r.writeFileToWorkDir(filePath, f.Mode, data); err != nil {
+				return err
+			}
+		}
+
+		hBytes, err := hex.DecodeString(f.Hash)
+		if err != nil {
+			return err
+		}
+		var sha [20]byte
+		copy(sha[:], hBytes)
+
+		m := uint32(0100644)
+		if f.Mode == "100755" || f.Mode == "0100755" {
+			m = 0100755
+		} else if f.Mode == "120000" || f.Mode == "0120000" {
+			m = 0120000
+		}
+
+		newIdx.AddOrUpdate(index.IndexEntry{
+			Mode:     m,
+			FileSize: uint32(len(data)),
+			Sha1:     sha,
+			Path:     p,
+		})
+	}
+
+	return r.SaveIndex(newIdx)
+}
+
+func (r *Repository) checkWorktreeDirty(incomingChanges map[string]bool, operation string) error {
+	st, err := r.Status()
+	if err != nil {
+		return err
+	}
+	var dirtyPaths []string
+	for _, s := range st.Staged {
+		if incomingChanges[s.Path] {
+			dirtyPaths = append(dirtyPaths, s.Path)
+		}
+	}
+	for _, u := range st.Unstaged {
+		if incomingChanges[u.Path] {
+			dirtyPaths = append(dirtyPaths, u.Path)
+		}
+	}
+	for _, um := range st.Unmerged {
+		if incomingChanges[um.Path] {
+			dirtyPaths = append(dirtyPaths, um.Path)
+		}
+	}
+	if len(dirtyPaths) > 0 {
+		sort.Strings(dirtyPaths)
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("error: Your local changes to the following files would be overwritten by %s:\n", operation))
+		for _, p := range dirtyPaths {
+			sb.WriteString(fmt.Sprintf("\t%s\n", p))
+		}
+		sb.WriteString(fmt.Sprintf("Please commit your changes or stash them before you %s.\nAborting", operation))
+		return errors.New(sb.String())
+	}
+	return nil
+}
+
+func (r *Repository) mergeTrees3Way(baseFiles, ourFiles, theirFiles map[string]FlattenedFile, labelTheirs string) (*index.Index, bool, error) {
+	allPathsMap := make(map[string]bool)
+	for p := range baseFiles {
+		allPathsMap[p] = true
+	}
+	for p := range ourFiles {
+		allPathsMap[p] = true
+	}
+	for p := range theirFiles {
+		allPathsMap[p] = true
+	}
+
+	var allPaths []string
+	for p := range allPathsMap {
+		allPaths = append(allPaths, p)
+	}
+	sort.Strings(allPaths)
+
+	idx, err := r.LoadIndex()
+	if err != nil {
+		idx = &index.Index{}
+	}
+
+	for p, f := range ourFiles {
+		if !idx.Has(p) {
+			hBytes, _ := hex.DecodeString(f.Hash)
+			var sha [20]byte
+			copy(sha[:], hBytes)
+			m := uint32(0100644)
+			if f.Mode == "100755" {
+				m = 0100755
+			} else if f.Mode == "120000" {
+				m = 0120000
+			}
+			idx.AddOrUpdate(index.IndexEntry{Mode: m, Sha1: sha, Path: p})
+		}
+	}
+
+	hasConflict := false
+
+	for _, p := range allPaths {
+		fBase, inBase := baseFiles[p]
+		fOurs, inOurs := ourFiles[p]
+		fTheirs, inTheirs := theirFiles[p]
+
+		filePath := filepath.Join(r.WorkDir, filepath.FromSlash(p))
+
+		if !inBase && inOurs && !inTheirs {
+			continue
+		}
+		if !inBase && !inOurs && inTheirs {
+			_, data, _, err := object.ReadObject(r.GitDir, fTheirs.Hash)
+			if err != nil {
+				return nil, false, err
+			}
+			if err := r.writeFileToWorkDir(filePath, fTheirs.Mode, data); err != nil {
+				return nil, false, err
+			}
+			hBytes, _ := hex.DecodeString(fTheirs.Hash)
+			var sha [20]byte
+			copy(sha[:], hBytes)
+			m := uint32(0100644)
+			if fTheirs.Mode == "100755" {
+				m = 0100755
+			} else if fTheirs.Mode == "120000" {
+				m = 0120000
+			}
+			idx.AddOrUpdate(index.IndexEntry{Mode: m, FileSize: uint32(len(data)), Sha1: sha, Path: p})
+			continue
+		}
+		if inBase && !inOurs && inTheirs {
+			if fBase.Hash == fTheirs.Hash {
+				continue
+			}
+			hasConflict = true
+			idx.Remove(p)
+			_, baseData, _, _ := object.ReadObject(r.GitDir, fBase.Hash)
+			_, theirData, _, _ := object.ReadObject(r.GitDir, fTheirs.Hash)
+			idx.AddOrUpdate(createStageEntry(p, 1, fBase.Mode, fBase.Hash, len(baseData)))
+			idx.AddOrUpdate(createStageEntry(p, 3, fTheirs.Mode, fTheirs.Hash, len(theirData)))
+			_ = r.writeFileToWorkDir(filePath, fTheirs.Mode, theirData)
+			continue
+		}
+		if inBase && inOurs && !inTheirs {
+			if fBase.Hash == fOurs.Hash {
+				_ = os.Remove(filePath)
+				cleanEmptyDirs(filepath.Dir(filePath), r.WorkDir)
+				idx.Remove(p)
+				continue
+			}
+			hasConflict = true
+			idx.Remove(p)
+			_, baseData, _, _ := object.ReadObject(r.GitDir, fBase.Hash)
+			_, ourData, _, _ := object.ReadObject(r.GitDir, fOurs.Hash)
+			idx.AddOrUpdate(createStageEntry(p, 1, fBase.Mode, fBase.Hash, len(baseData)))
+			idx.AddOrUpdate(createStageEntry(p, 2, fOurs.Mode, fOurs.Hash, len(ourData)))
+			_ = r.writeFileToWorkDir(filePath, fOurs.Mode, ourData)
+			continue
+		}
+		if inOurs && inTheirs && fOurs.Hash == fTheirs.Hash {
+			continue
+		}
+		if inBase && inOurs && inTheirs {
+			if fOurs.Hash == fBase.Hash && fTheirs.Hash != fBase.Hash {
+				_, data, _, err := object.ReadObject(r.GitDir, fTheirs.Hash)
+				if err != nil {
+					return nil, false, err
+				}
+				if err := r.writeFileToWorkDir(filePath, fTheirs.Mode, data); err != nil {
+					return nil, false, err
+				}
+				hBytes, _ := hex.DecodeString(fTheirs.Hash)
+				var sha [20]byte
+				copy(sha[:], hBytes)
+				m := uint32(0100644)
+				if fTheirs.Mode == "100755" {
+					m = 0100755
+				} else if fTheirs.Mode == "120000" {
+					m = 0120000
+				}
+				idx.AddOrUpdate(index.IndexEntry{Mode: m, FileSize: uint32(len(data)), Sha1: sha, Path: p})
+				continue
+			}
+			if fTheirs.Hash == fBase.Hash && fOurs.Hash != fBase.Hash {
+				continue
+			}
+		}
+
+		var baseData, ourData, theirData []byte
+		if inBase {
+			_, baseData, _, _ = object.ReadObject(r.GitDir, fBase.Hash)
+		}
+		if inOurs {
+			_, ourData, _, _ = object.ReadObject(r.GitDir, fOurs.Hash)
+		}
+		if inTheirs {
+			_, theirData, _, _ = object.ReadObject(r.GitDir, fTheirs.Hash)
+		}
+
+		if diff.IsBinary(baseData) || diff.IsBinary(ourData) || diff.IsBinary(theirData) {
+			hasConflict = true
+			idx.Remove(p)
+			if inBase {
+				idx.AddOrUpdate(createStageEntry(p, 1, fBase.Mode, fBase.Hash, len(baseData)))
+			}
+			if inOurs {
+				idx.AddOrUpdate(createStageEntry(p, 2, fOurs.Mode, fOurs.Hash, len(ourData)))
+				_ = r.writeFileToWorkDir(filePath, fOurs.Mode, ourData)
+			}
+			if inTheirs {
+				idx.AddOrUpdate(createStageEntry(p, 3, fTheirs.Mode, fTheirs.Hash, len(theirData)))
+				if !inOurs {
+					_ = r.writeFileToWorkDir(filePath, fTheirs.Mode, theirData)
+				}
+			}
+			continue
+		}
+
+		mergedContent, fileConflict := diff.Merge3(string(baseData), string(ourData), string(theirData), labelTheirs)
+		mode := fOurs.Mode
+		if mode == "" {
+			mode = fTheirs.Mode
+		}
+		if err := r.writeFileToWorkDir(filePath, mode, []byte(mergedContent)); err != nil {
+			return nil, false, err
+		}
+
+		if fileConflict {
+			hasConflict = true
+			idx.Remove(p)
+			if inBase {
+				idx.AddOrUpdate(createStageEntry(p, 1, fBase.Mode, fBase.Hash, len(baseData)))
+			}
+			if inOurs {
+				idx.AddOrUpdate(createStageEntry(p, 2, fOurs.Mode, fOurs.Hash, len(ourData)))
+			}
+			if inTheirs {
+				idx.AddOrUpdate(createStageEntry(p, 3, fTheirs.Mode, fTheirs.Hash, len(theirData)))
+			}
+		} else {
+			blobHash, err := object.WriteObject(r.GitDir, object.TypeBlob, []byte(mergedContent))
+			if err != nil {
+				return nil, false, err
+			}
+			hBytes, _ := hex.DecodeString(blobHash)
+			var sha [20]byte
+			copy(sha[:], hBytes)
+			m := uint32(0100644)
+			if mode == "100755" || mode == "0100755" {
+				m = 0100755
+			} else if mode == "120000" || mode == "0120000" {
+				m = 0120000
+			}
+			idx.AddOrUpdate(index.IndexEntry{
+				Mode:     m,
+				FileSize: uint32(len(mergedContent)),
+				Sha1:     sha,
+				Path:     p,
+			})
+		}
+	}
+
+	return idx, hasConflict, nil
 }

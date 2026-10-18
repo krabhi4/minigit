@@ -54,6 +54,12 @@ func main() {
 		err = handleMerge(args)
 	case "tag":
 		err = handleTag(args)
+	case "stash":
+		err = handleStash(args)
+	case "reset":
+		err = handleReset(args)
+	case "cherry-pick":
+		err = handleCherryPick(args)
 	case "version", "--version", "-v":
 		fmt.Println("minigit version 1.0.0")
 		return
@@ -90,6 +96,9 @@ func printUsage() {
 	fmt.Println("   diff         Show changes between commits, commit and working tree, etc")
 	fmt.Println("   merge        Join two or more development histories together")
 	fmt.Println("   tag          Create or list tags")
+	fmt.Println("   stash        Stash the changes in a dirty working directory away")
+	fmt.Println("   reset        Reset current HEAD to the specified state")
+	fmt.Println("   cherry-pick  Apply the changes introduced by some existing commits")
 	fmt.Println("   version      Display version information")
 }
 
@@ -338,7 +347,16 @@ func handleStatus(args []string) error {
 		return nil
 	}
 
-	if st.IsMerging && len(st.Unmerged) == 0 {
+	if st.IsCherryPicking {
+		if len(st.Unmerged) == 0 {
+			fmt.Println("All conflicts fixed but you are still cherry-picking.")
+			fmt.Println("  (use \"minigit commit\" to conclude cherry-pick)")
+			fmt.Println()
+		} else {
+			fmt.Println("You are currently cherry-picking.")
+			fmt.Println()
+		}
+	} else if st.IsMerging && len(st.Unmerged) == 0 {
 		fmt.Println("All conflicts fixed but you are still merging.")
 		fmt.Println("  (use \"minigit commit\" to conclude merge)")
 		fmt.Println()
@@ -356,7 +374,11 @@ func handleStatus(args []string) error {
 	if len(st.Unmerged) > 0 {
 		fmt.Println("You have unmerged paths.")
 		fmt.Println("  (fix conflicts and run \"minigit commit\")")
-		fmt.Println("  (use \"minigit merge --abort\" to abort the merge)")
+		if st.IsMerging {
+			fmt.Println("  (use \"minigit merge --abort\" to abort the merge)")
+		} else if st.IsCherryPicking {
+			fmt.Println("  (use \"minigit cherry-pick --abort\" to abort the cherry-pick)")
+		}
 		fmt.Println()
 		fmt.Println("Unmerged paths:")
 		fmt.Println("  (use \"minigit add <file>...\" to mark resolution)")
@@ -656,4 +678,297 @@ func isTTY() bool {
 		return false
 	}
 	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+func handleReset(args []string) error {
+	mode := repo.ResetMixed
+	modeSpecified := false
+	target := "HEAD"
+	var pathArgs []string
+	var nonFlagArgs []string
+
+	doubleDashIdx := -1
+	for i, arg := range args {
+		if arg == "--" {
+			doubleDashIdx = i
+			break
+		}
+	}
+
+	var beforeDoubleDash []string
+	if doubleDashIdx != -1 {
+		beforeDoubleDash = args[:doubleDashIdx]
+		pathArgs = append(pathArgs, args[doubleDashIdx+1:]...)
+	} else {
+		beforeDoubleDash = args
+	}
+
+	for _, arg := range beforeDoubleDash {
+		switch arg {
+		case "--soft":
+			mode = repo.ResetSoft
+			modeSpecified = true
+		case "--mixed":
+			mode = repo.ResetMixed
+			modeSpecified = true
+		case "--hard":
+			mode = repo.ResetHard
+			modeSpecified = true
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return fmt.Errorf("unknown option: %s", arg)
+			}
+			nonFlagArgs = append(nonFlagArgs, arg)
+		}
+	}
+
+	r, err := repo.FindRepo(".")
+	if err != nil {
+		return err
+	}
+
+	if doubleDashIdx != -1 {
+		if len(nonFlagArgs) > 1 {
+			return fmt.Errorf("fatal: Cannot do reset with multiple commits")
+		}
+		if len(nonFlagArgs) == 1 {
+			target = nonFlagArgs[0]
+		}
+	} else {
+		if len(nonFlagArgs) > 0 {
+			firstArgIsRev := false
+			if _, err := r.ResolveRevision(nonFlagArgs[0]); err == nil {
+				firstArgIsRev = true
+			}
+			if firstArgIsRev {
+				target = nonFlagArgs[0]
+				pathArgs = append(pathArgs, nonFlagArgs[1:]...)
+			} else {
+				pathArgs = append(pathArgs, nonFlagArgs...)
+			}
+		}
+	}
+
+	if len(pathArgs) > 0 {
+		if modeSpecified && mode != repo.ResetMixed {
+			modeStr := "hard"
+			if mode == repo.ResetSoft {
+				modeStr = "soft"
+			}
+			return fmt.Errorf("fatal: Cannot do %s reset with paths.", modeStr)
+		}
+		return r.ResetPaths(target, pathArgs)
+	}
+
+	msg, err := r.Reset(mode, target)
+	if err != nil {
+		return err
+	}
+	if msg != "" {
+		fmt.Print(msg)
+	}
+	return nil
+}
+
+func handleStash(args []string) error {
+	r, err := repo.FindRepo(".")
+	if err != nil {
+		return err
+	}
+
+	if len(args) == 0 {
+		msg, err := r.StashPush("")
+		if err != nil {
+			return err
+		}
+		if msg != "" {
+			fmt.Println(msg)
+		}
+		return nil
+	}
+
+	subcmd := args[0]
+	switch subcmd {
+	case "list":
+		entries, err := r.StashList()
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			fmt.Println(e)
+		}
+		return nil
+
+	case "pop":
+		restoreIndex := false
+		spec := ""
+		for _, a := range args[1:] {
+			if a == "--index" {
+				restoreIndex = true
+			} else if spec == "" && !strings.HasPrefix(a, "-") {
+				spec = a
+			}
+		}
+		msg, err := r.StashPop(spec, restoreIndex)
+		if err != nil {
+			return err
+		}
+		if msg != "" {
+			fmt.Println(msg)
+		}
+		return nil
+
+	case "apply":
+		restoreIndex := false
+		spec := ""
+		for _, a := range args[1:] {
+			if a == "--index" {
+				restoreIndex = true
+			} else if spec == "" && !strings.HasPrefix(a, "-") {
+				spec = a
+			}
+		}
+		msg, err := r.StashApply(spec, restoreIndex)
+		if err != nil {
+			return err
+		}
+		if msg != "" {
+			fmt.Println(msg)
+		}
+		return nil
+
+	case "drop":
+		spec := ""
+		if len(args) > 1 {
+			spec = args[1]
+		}
+		msg, err := r.StashDrop(spec)
+		if err != nil {
+			return err
+		}
+		if msg != "" {
+			fmt.Println(msg)
+		}
+		return nil
+
+	case "clear":
+		return r.StashClear()
+
+	case "push":
+		msg := parseStashPushMsg(args[1:])
+		out, err := r.StashPush(msg)
+		if err != nil {
+			return err
+		}
+		if out != "" {
+			fmt.Println(out)
+		}
+		return nil
+
+	case "save":
+		msg := ""
+		if len(args) > 1 {
+			msg = strings.Join(args[1:], " ")
+		}
+		out, err := r.StashPush(msg)
+		if err != nil {
+			return err
+		}
+		if out != "" {
+			fmt.Println(out)
+		}
+		return nil
+
+	default:
+		if strings.HasPrefix(subcmd, "-") {
+			msg := parseStashPushMsg(args)
+			out, err := r.StashPush(msg)
+			if err != nil {
+				return err
+			}
+			if out != "" {
+				fmt.Println(out)
+			}
+			return nil
+		}
+		return fmt.Errorf("usage: minigit stash [push|list|pop|apply|drop|clear] [<args>]")
+	}
+}
+
+func parseStashPushMsg(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-m" || args[i] == "--message" {
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+		}
+	}
+	var nonFlags []string
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			nonFlags = append(nonFlags, a)
+		}
+	}
+	if len(nonFlags) > 0 {
+		return strings.Join(nonFlags, " ")
+	}
+	return ""
+}
+
+func handleCherryPick(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: minigit cherry-pick <commit>")
+	}
+
+	r, err := repo.FindRepo(".")
+	if err != nil {
+		return err
+	}
+
+	if args[0] == "--abort" {
+		return r.CherryPickAbort()
+	}
+
+	if args[0] == "--continue" {
+		msg, err := r.CherryPickContinue()
+		if err != nil {
+			return err
+		}
+		if msg != "" {
+			fmt.Println(msg)
+		}
+		return nil
+	}
+
+	parentNum := 0
+	targetCommit := ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-m" || args[i] == "--mainline" {
+			if i+1 < len(args) {
+				var err error
+				parentNum, err = strconv.Atoi(args[i+1])
+				if err != nil {
+					return fmt.Errorf("invalid mainline parent number: %s", args[i+1])
+				}
+				i++
+			} else {
+				return fmt.Errorf("switch 'm' requires a value")
+			}
+		} else if !strings.HasPrefix(args[i], "-") {
+			targetCommit = args[i]
+		}
+	}
+
+	if targetCommit == "" {
+		return fmt.Errorf("usage: minigit cherry-pick <commit>")
+	}
+
+	msg, err := r.CherryPick(targetCommit, parentNum)
+	if err != nil {
+		return err
+	}
+	if msg != "" {
+		fmt.Println(msg)
+	}
+	return nil
 }

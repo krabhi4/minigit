@@ -994,6 +994,15 @@ func TestResolveRevisionAndDiff(t *testing.T) {
 		t.Fatalf("expected short prefix to resolve to %s, got %s (err: %v)", c1, revShort, err)
 	}
 
+	revCompound, err := r.ResolveRevision("HEAD~0^1")
+	if err != nil || revCompound != c1 {
+		t.Fatalf("expected HEAD~0^1 to resolve to %s, got %s (err: %v)", c1, revCompound, err)
+	}
+	revCompound2, err := r.ResolveRevision("HEAD^1~0")
+	if err != nil || revCompound2 != c1 {
+		t.Fatalf("expected HEAD^1~0 to resolve to %s, got %s (err: %v)", c1, revCompound2, err)
+	}
+
 	diffCommits, err := r.DiffCommits("HEAD~1", "HEAD")
 	if err != nil {
 		t.Fatalf("DiffCommits failed: %v", err)
