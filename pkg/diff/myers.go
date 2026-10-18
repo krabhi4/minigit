@@ -510,6 +510,10 @@ func Merge3(base, ours, theirs, targetName string) (string, bool) {
 	if len(out) == 0 {
 		return "", hasConflict
 	}
-	return strings.Join(out, "\n") + "\n", hasConflict
+	res := strings.Join(out, "\n")
+	if hasConflict || strings.HasSuffix(ours, "\n") || strings.HasSuffix(theirs, "\n") {
+		res += "\n"
+	}
+	return res, hasConflict
 }
 

@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -491,7 +492,15 @@ func (r *Repository) Commit(message string, author string) (string, error) {
 		return "", err
 	}
 
-	if headHash != "" {
+	mergeHeadPath := filepath.Join(r.GitDir, "MERGE_HEAD")
+	mergeHeadData, mergeErr := os.ReadFile(mergeHeadPath)
+	isMerging := mergeErr == nil && len(bytes.TrimSpace(mergeHeadData)) > 0
+	var mergeParentHash string
+	if isMerging {
+		mergeParentHash = string(bytes.TrimSpace(mergeHeadData))
+	}
+
+	if headHash != "" && !isMerging {
 		parentCommit, err := r.LoadCommit(headHash)
 		if err == nil && parentCommit.TreeHash == treeHash {
 			return "", errors.New("nothing to commit, working tree clean")
@@ -501,6 +510,9 @@ func (r *Repository) Commit(message string, author string) (string, error) {
 	var parentHashes []string
 	if headHash != "" {
 		parentHashes = append(parentHashes, headHash)
+	}
+	if isMerging && mergeParentHash != "" {
+		parentHashes = append(parentHashes, mergeParentHash)
 	}
 
 	if author == "" {
@@ -539,6 +551,12 @@ func (r *Repository) Commit(message string, author string) (string, error) {
 		if err := r.SetHEADDetached(commitHash); err != nil {
 			return "", err
 		}
+	}
+
+	if isMerging {
+		_ = os.Remove(mergeHeadPath)
+		_ = os.Remove(filepath.Join(r.GitDir, "MERGE_MSG"))
+		_ = os.Remove(filepath.Join(r.GitDir, "MERGE_MODE"))
 	}
 
 	return commitHash, nil
@@ -625,6 +643,7 @@ type RepoStatus struct {
 	Branch     string
 	IsDetached bool
 	HEADHash   string
+	IsMerging  bool
 	Staged     []FileStatus
 	Unstaged   []FileStatus
 	Untracked  []string
@@ -642,6 +661,10 @@ func (r *Repository) Status() (*RepoStatus, error) {
 		Branch:     branch,
 		IsDetached: !isSymbolic,
 		HEADHash:   headHash,
+	}
+
+	if _, err := os.Stat(filepath.Join(r.GitDir, "MERGE_HEAD")); err == nil {
+		res.IsMerging = true
 	}
 
 	var headFiles map[string]FlattenedFile
@@ -783,7 +806,7 @@ func (r *Repository) Status() (*RepoStatus, error) {
 	sort.Slice(res.Unmerged, func(i, j int) bool { return res.Unmerged[i].Path < res.Unmerged[j].Path })
 	sort.Strings(res.Untracked)
 
-	res.Clean = len(res.Staged) == 0 && len(res.Unstaged) == 0 && len(res.Untracked) == 0 && len(res.Unmerged) == 0
+	res.Clean = len(res.Staged) == 0 && len(res.Unstaged) == 0 && len(res.Untracked) == 0 && len(res.Unmerged) == 0 && !res.IsMerging
 	return res, nil
 }
 
@@ -954,6 +977,13 @@ func (r *Repository) Diff(staged bool) (string, error) {
 			headFiles = make(map[string]FlattenedFile)
 		}
 
+		unmergedPaths := make(map[string]bool)
+		for _, entry := range idx.Entries {
+			if entry.Stage() != 0 {
+				unmergedPaths[entry.Path] = true
+			}
+		}
+
 		idxMap := make(map[string]index.IndexEntry)
 		allPathsMap := make(map[string]bool)
 		for _, entry := range idx.Entries {
@@ -963,6 +993,9 @@ func (r *Repository) Diff(staged bool) (string, error) {
 			}
 		}
 		for p := range headFiles {
+			if unmergedPaths[p] {
+				continue
+			}
 			allPathsMap[p] = true
 		}
 
@@ -973,6 +1006,9 @@ func (r *Repository) Diff(staged bool) (string, error) {
 		sort.Strings(allPaths)
 
 		for _, p := range allPaths {
+			if unmergedPaths[p] {
+				continue
+			}
 			idxEntry, inIdx := idxMap[p]
 			headEntry, inHead := headFiles[p]
 
@@ -1194,8 +1230,7 @@ func (r *Repository) Merge(target string) (string, error) {
 			_, theirData, _, _ := object.ReadObject(r.GitDir, fTheirs.Hash)
 			idx.AddOrUpdate(createStageEntry(p, 1, fBase.Mode, fBase.Hash, len(baseData)))
 			idx.AddOrUpdate(createStageEntry(p, 3, fTheirs.Mode, fTheirs.Hash, len(theirData)))
-			conflictData := fmt.Sprintf("<<<<<<< HEAD\n=======\n%s>>>>>>> %s\n", string(theirData), target)
-			_ = r.writeFileToWorkDir(filePath, fTheirs.Mode, []byte(conflictData))
+			_ = r.writeFileToWorkDir(filePath, fTheirs.Mode, theirData)
 			continue
 		}
 		if inBase && inOurs && !inTheirs {
@@ -1211,8 +1246,7 @@ func (r *Repository) Merge(target string) (string, error) {
 			_, ourData, _, _ := object.ReadObject(r.GitDir, fOurs.Hash)
 			idx.AddOrUpdate(createStageEntry(p, 1, fBase.Mode, fBase.Hash, len(baseData)))
 			idx.AddOrUpdate(createStageEntry(p, 2, fOurs.Mode, fOurs.Hash, len(ourData)))
-			conflictData := fmt.Sprintf("<<<<<<< HEAD\n%s=======\n>>>>>>> %s\n", string(ourData), target)
-			_ = r.writeFileToWorkDir(filePath, fOurs.Mode, []byte(conflictData))
+			_ = r.writeFileToWorkDir(filePath, fOurs.Mode, ourData)
 			continue
 		}
 		if inOurs && inTheirs && fOurs.Hash == fTheirs.Hash {
@@ -1300,6 +1334,8 @@ func (r *Repository) Merge(target string) (string, error) {
 	}
 
 	if hasConflict {
+		_ = os.WriteFile(filepath.Join(r.GitDir, "MERGE_HEAD"), []byte(targetCommitHash+"\n"), 0644)
+		_ = os.WriteFile(filepath.Join(r.GitDir, "MERGE_MSG"), []byte(fmt.Sprintf("Merge branch '%s'\n", target)), 0644)
 		_ = r.SaveIndex(idx)
 		return "", errors.New("Automatic merge failed; fix conflicts and then commit the result.")
 	}
@@ -1350,6 +1386,80 @@ func (r *Repository) Merge(target string) (string, error) {
 	}
 
 	return fmt.Sprintf("Merged %s into %s (%s)", target, currentBranch, commitHash[:7]), nil
+}
+
+func (r *Repository) MergeAbort() error {
+	mergeHeadPath := filepath.Join(r.GitDir, "MERGE_HEAD")
+	if _, err := os.Stat(mergeHeadPath); os.IsNotExist(err) {
+		return errors.New("fatal: There is no merge to abort (MERGE_HEAD missing).")
+	}
+
+	_, _, headHash, err := r.ResolveHEAD()
+	if err != nil {
+		return err
+	}
+	if headHash == "" {
+		return errors.New("fatal: HEAD is invalid")
+	}
+
+	headCommit, err := r.LoadCommit(headHash)
+	if err != nil {
+		return err
+	}
+
+	headFiles, err := r.FlattenTree(headCommit.TreeHash, "")
+	if err != nil {
+		return err
+	}
+
+	idx, err := r.LoadIndex()
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range idx.Entries {
+		filePath := filepath.Join(r.WorkDir, filepath.FromSlash(entry.Path))
+		if _, inHead := headFiles[entry.Path]; !inHead {
+			_ = os.Remove(filePath)
+			cleanEmptyDirs(filepath.Dir(filePath), r.WorkDir)
+		}
+	}
+
+	newIdx := &index.Index{}
+	for p, f := range headFiles {
+		filePath := filepath.Join(r.WorkDir, filepath.FromSlash(p))
+		_, data, _, err := object.ReadObject(r.GitDir, f.Hash)
+		if err != nil {
+			return err
+		}
+		if err := r.writeFileToWorkDir(filePath, f.Mode, data); err != nil {
+			return err
+		}
+		hBytes, _ := hex.DecodeString(f.Hash)
+		var sha [20]byte
+		copy(sha[:], hBytes)
+		m := uint32(0100644)
+		if f.Mode == "100755" || f.Mode == "0100755" {
+			m = 0100755
+		} else if f.Mode == "120000" || f.Mode == "0120000" {
+			m = 0120000
+		}
+		newIdx.AddOrUpdate(index.IndexEntry{
+			Mode:     m,
+			FileSize: uint32(len(data)),
+			Sha1:     sha,
+			Path:     p,
+		})
+	}
+
+	if err := r.SaveIndex(newIdx); err != nil {
+		return err
+	}
+
+	_ = os.Remove(mergeHeadPath)
+	_ = os.Remove(filepath.Join(r.GitDir, "MERGE_MSG"))
+	_ = os.Remove(filepath.Join(r.GitDir, "MERGE_MODE"))
+	return nil
 }
 
 func (r *Repository) FindMergeBase(commitA, commitB string) (string, error) {

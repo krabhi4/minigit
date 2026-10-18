@@ -614,6 +614,12 @@ func TestMultiStageConflictAndStatusIntegration(t *testing.T) {
 
 	runCmd(t, tempDir, binPath, "commit", "-m", "Resolved merge conflict")
 
+	parentsOut := runCmd(t, tempDir, "git", "rev-parse", "HEAD^@")
+	parentHashes := strings.Fields(parentsOut)
+	if len(parentHashes) != 2 {
+		t.Fatalf("expected 2 parents on merge commit from git rev-parse HEAD^@, got %v", parentHashes)
+	}
+
 	finalStatus := runCmd(t, tempDir, binPath, "status")
 	if !strings.Contains(finalStatus, "nothing to commit, working tree clean") {
 		t.Fatalf("expected clean status after merge commit: %s", finalStatus)
@@ -624,4 +630,133 @@ func TestMultiStageConflictAndStatusIntegration(t *testing.T) {
 		t.Fatalf("git fsck reported corruption after merge resolution: %s", fsckFinal)
 	}
 }
+
+func TestMergeAbortIntegration(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-integ-abort-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	binPath, err := filepath.Abs("../minigit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCmd(t, tempDir, binPath, "init")
+
+	fPath := filepath.Join(tempDir, "file.txt")
+	if err := os.WriteFile(fPath, []byte("base line\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "file.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Base commit")
+
+	runCmd(t, tempDir, binPath, "branch", "feature-x")
+
+	if err := os.WriteFile(fPath, []byte("main line\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "file.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Main edit")
+
+	runCmd(t, tempDir, binPath, "checkout", "feature-x")
+	if err := os.WriteFile(fPath, []byte("feature line\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	extraPath := filepath.Join(tempDir, "extra.txt")
+	if err := os.WriteFile(extraPath, []byte("extra data\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "file.txt", "extra.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Feature edit")
+
+	runCmd(t, tempDir, binPath, "checkout", "main")
+
+	mergeCmd := exec.Command(binPath, "merge", "feature-x")
+	mergeCmd.Dir = tempDir
+	mergeOut, err := mergeCmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected merge conflict, got success: %s", string(mergeOut))
+	}
+
+	statusBefore := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(statusBefore, "You have unmerged paths.") {
+		t.Fatalf("expected unmerged paths notice in status: %s", statusBefore)
+	}
+
+	abortOut := runCmd(t, tempDir, binPath, "merge", "--abort")
+	_ = abortOut
+
+	statusAfter := runCmd(t, tempDir, binPath, "status")
+	if !strings.Contains(statusAfter, "nothing to commit, working tree clean") {
+		t.Fatalf("expected clean status after merge --abort: %s", statusAfter)
+	}
+
+	data, err := os.ReadFile(fPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "main line\n" {
+		t.Fatalf("expected file.txt reverted to main line, got: %s", string(data))
+	}
+
+	if _, err := os.Stat(extraPath); !os.IsNotExist(err) {
+		t.Fatalf("expected extra.txt removed after abort")
+	}
+
+	fsckOut := runCmd(t, tempDir, "git", "fsck", "--full")
+	if strings.Contains(fsckOut, "error") || strings.Contains(fsckOut, "fatal") || strings.Contains(fsckOut, "corrupt") {
+		t.Fatalf("git fsck reported corruption after abort: %s", fsckOut)
+	}
+}
+
+func TestDiffStagedUnmergedIntegration(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-integ-diff-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	binPath, err := filepath.Abs("../minigit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCmd(t, tempDir, binPath, "init")
+
+	fPath := filepath.Join(tempDir, "shared.txt")
+	if err := os.WriteFile(fPath, []byte("base\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "shared.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Base")
+
+	runCmd(t, tempDir, binPath, "branch", "branch-y")
+
+	if err := os.WriteFile(fPath, []byte("main version\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "shared.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Main edit")
+
+	runCmd(t, tempDir, binPath, "checkout", "branch-y")
+	if err := os.WriteFile(fPath, []byte("branch version\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, tempDir, binPath, "add", "shared.txt")
+	runCmd(t, tempDir, binPath, "commit", "-m", "Branch edit")
+
+	runCmd(t, tempDir, binPath, "checkout", "main")
+
+	mergeCmd := exec.Command(binPath, "merge", "branch-y")
+	mergeCmd.Dir = tempDir
+	_, _ = mergeCmd.CombinedOutput()
+
+	diffOut := runCmd(t, tempDir, binPath, "diff", "--staged")
+	if strings.Contains(diffOut, "+++ /dev/null") || strings.Contains(diffOut, "--- a/shared.txt") {
+		t.Fatalf("diff --staged should not report unmerged shared.txt as deleted: %s", diffOut)
+	}
+}
+
 

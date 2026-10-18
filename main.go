@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -243,22 +245,30 @@ func handleCommit(args []string) error {
 	author := fs.String("author", "", "author info")
 	_ = fs.Parse(args)
 
-	if *msg == "" {
-		return fmt.Errorf("commit message cannot be empty (use -m <msg>)")
-	}
-
 	r, err := repo.FindRepo(".")
 	if err != nil {
 		return err
 	}
 
-	hash, err := r.Commit(*msg, *author)
+	msgStr := *msg
+	if msgStr == "" {
+		mergeMsgData, err := os.ReadFile(filepath.Join(r.GitDir, "MERGE_MSG"))
+		if err == nil && len(bytes.TrimSpace(mergeMsgData)) > 0 {
+			msgStr = strings.TrimSpace(string(mergeMsgData))
+		}
+	}
+
+	if msgStr == "" {
+		return fmt.Errorf("commit message cannot be empty (use -m <msg>)")
+	}
+
+	hash, err := r.Commit(msgStr, *author)
 	if err != nil {
 		return err
 	}
 
 	branch, _, _, _ := r.ResolveHEAD()
-	firstLine := strings.SplitN(*msg, "\n", 2)[0]
+	firstLine := strings.SplitN(msgStr, "\n", 2)[0]
 	fmt.Printf("[%s %s] %s\n", branch, hash[:7], firstLine)
 	return nil
 }
@@ -283,6 +293,12 @@ func handleStatus(args []string) error {
 	if st.Clean {
 		fmt.Println("nothing to commit, working tree clean")
 		return nil
+	}
+
+	if st.IsMerging && len(st.Unmerged) == 0 {
+		fmt.Println("All conflicts fixed but you are still merging.")
+		fmt.Println("  (use \"minigit commit\" to conclude merge)")
+		fmt.Println()
 	}
 
 	if len(st.Staged) > 0 {
@@ -529,6 +545,9 @@ func handleMerge(args []string) error {
 	r, err := repo.FindRepo(".")
 	if err != nil {
 		return err
+	}
+	if args[0] == "--abort" {
+		return r.MergeAbort()
 	}
 	target := args[0]
 	msg, err := r.Merge(target)

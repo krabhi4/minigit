@@ -188,4 +188,20 @@ func TestMerge3EmptyBase(t *testing.T) {
 	}
 }
 
+func TestMerge3TrailingNewlinePreserved(t *testing.T) {
+	base := "line1\nline2\nline3"
+	ours := "line1\nline2\nline3-mod"
+	theirs := "line1-mod\nline2\nline3"
+
+	merged, conflict := Merge3(base, ours, theirs, "feature")
+	if conflict {
+		t.Fatalf("expected clean merge: %s", merged)
+	}
+	expected := "line1-mod\nline2\nline3-mod"
+	if merged != expected {
+		t.Fatalf("expected %q, got %q", expected, merged)
+	}
+}
+
+
 

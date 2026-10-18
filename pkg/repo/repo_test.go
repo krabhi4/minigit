@@ -372,6 +372,17 @@ func TestRepoMergeMultiStageConflictsAndStatus(t *testing.T) {
 		t.Fatalf("expected valid commit hash, got %s", resolveHash)
 	}
 
+	resolveCommit, err := r.LoadCommit(resolveHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolveCommit.ParentHashes) != 2 {
+		t.Fatalf("expected 2 parent hashes for merge commit, got %v", resolveCommit.ParentHashes)
+	}
+	if _, err := os.Stat(filepath.Join(r.GitDir, "MERGE_HEAD")); !os.IsNotExist(err) {
+		t.Fatalf("expected MERGE_HEAD to be removed after commit")
+	}
+
 	finalStatus, err := r.Status()
 	if err != nil {
 		t.Fatal(err)
@@ -380,4 +391,268 @@ func TestRepoMergeMultiStageConflictsAndStatus(t *testing.T) {
 		t.Fatalf("expected clean status after commit: %+v", finalStatus)
 	}
 }
+
+func TestRepoMergeAbort(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-abort-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	r, err := Init(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fPath := filepath.Join(tempDir, "shared.txt")
+	if err := os.WriteFile(fPath, []byte("line 1\nline 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"shared.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	baseHash, err := r.Commit("Base", "Tester <t@t.com>")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.CreateBranch("side", baseHash); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(fPath, []byte("line 1 main\nline 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"shared.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Commit("Main edit", "Tester <t@t.com>"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Checkout("side"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fPath, []byte("line 1 side\nline 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	newFile := filepath.Join(tempDir, "side_only.txt")
+	if err := os.WriteFile(newFile, []byte("only in side\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"shared.txt", "side_only.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Commit("Side edit", "Tester <t@t.com>"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Checkout("main"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = r.Merge("side")
+	if err == nil {
+		t.Fatalf("expected merge conflict")
+	}
+
+	if _, err := os.Stat(filepath.Join(r.GitDir, "MERGE_HEAD")); err != nil {
+		t.Fatalf("expected MERGE_HEAD to exist during conflict: %v", err)
+	}
+
+	diffStaged, err := r.Diff(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(diffStaged, "shared.txt") {
+		t.Fatalf("diff staged should not report unmerged file: %s", diffStaged)
+	}
+
+	if err := r.MergeAbort(); err != nil {
+		t.Fatalf("MergeAbort failed: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(r.GitDir, "MERGE_HEAD")); !os.IsNotExist(err) {
+		t.Fatalf("expected MERGE_HEAD to be deleted after abort")
+	}
+
+	sharedData, err := os.ReadFile(fPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(sharedData) != "line 1 main\nline 2\n" {
+		t.Fatalf("expected shared.txt restored to HEAD content, got: %s", string(sharedData))
+	}
+
+	if _, err := os.Stat(newFile); !os.IsNotExist(err) {
+		t.Fatalf("expected side_only.txt removed after abort")
+	}
+
+	st, err := r.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Clean {
+		t.Fatalf("expected clean status after abort: %+v", st)
+	}
+
+	err = r.MergeAbort()
+	if err == nil || !strings.Contains(err.Error(), "There is no merge to abort") {
+		t.Fatalf("expected error on redundant abort, got: %v", err)
+	}
+}
+
+func TestRepoMergeSameTreeResolution(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-sametree-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	r, err := Init(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fPath := filepath.Join(tempDir, "shared.txt")
+	if err := os.WriteFile(fPath, []byte("original\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"shared.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	baseHash, err := r.Commit("Base", "Tester <t@t.com>")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.CreateBranch("branch-a", baseHash); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(fPath, []byte("main version\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"shared.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Commit("Main version", "Tester <t@t.com>"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Checkout("branch-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fPath, []byte("branch version\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"shared.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Commit("Branch version", "Tester <t@t.com>"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Checkout("main"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.Merge("branch-a")
+	if err == nil {
+		t.Fatalf("expected conflict")
+	}
+
+	if err := os.WriteFile(fPath, []byte("main version\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"shared.txt"}); err != nil {
+		t.Fatal(err)
+	}
+
+	commitHash, err := r.Commit("Keep ours", "Tester <t@t.com>")
+	if err != nil {
+		t.Fatalf("expected commit to succeed even when tree equals HEAD, got: %v", err)
+	}
+
+	c, err := r.LoadCommit(commitHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.ParentHashes) != 2 {
+		t.Fatalf("expected 2 parents for merge commit, got %v", c.ParentHashes)
+	}
+}
+
+func TestRepoModifyDeleteConflict(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "minigit-moddel-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	r, err := Init(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fPath := filepath.Join(tempDir, "mod_del.txt")
+	if err := os.WriteFile(fPath, []byte("base data\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"mod_del.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	baseHash, err := r.Commit("Base", "Tester <t@t.com>")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.CreateBranch("side", baseHash); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Remove([]string{"mod_del.txt"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Commit("Delete on main", "Tester <t@t.com>"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Checkout("side"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fPath, []byte("modified in side\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add([]string{"mod_del.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Commit("Modify on side", "Tester <t@t.com>"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Checkout("main"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.Merge("side")
+	if err == nil {
+		t.Fatalf("expected conflict on modify/delete")
+	}
+
+	st, err := r.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Unmerged) != 1 || st.Unmerged[0].Status != StatusDeletedByUs {
+		t.Fatalf("expected unmerged status deleted by us, got: %+v", st.Unmerged)
+	}
+
+	content, err := os.ReadFile(fPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "modified in side\n" {
+		t.Fatalf("expected raw modified content in tree, got: %q", string(content))
+	}
+}
+
 
