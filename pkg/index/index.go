@@ -46,27 +46,47 @@ func (idx *Index) Find(path string) (int, *IndexEntry) {
 }
 
 func (idx *Index) AddOrUpdate(entry IndexEntry) {
-	pos, _ := idx.Find(entry.Path)
-	if pos >= 0 {
-		idx.Entries[pos] = entry
-	} else {
+	entryStage := (entry.Flags >> 12) & 0x3
+	replaced := false
+	for i := range idx.Entries {
+		st := (idx.Entries[i].Flags >> 12) & 0x3
+		if idx.Entries[i].Path == entry.Path && st == entryStage {
+			idx.Entries[i] = entry
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		if entryStage == 0 {
+			idx.Remove(entry.Path)
+		}
 		idx.Entries = append(idx.Entries, entry)
 	}
 	idx.Sort()
 }
 
 func (idx *Index) Remove(path string) bool {
-	pos, _ := idx.Find(path)
-	if pos < 0 {
-		return false
+	found := false
+	filtered := idx.Entries[:0]
+	for _, entry := range idx.Entries {
+		if entry.Path == path {
+			found = true
+			continue
+		}
+		filtered = append(filtered, entry)
 	}
-	idx.Entries = append(idx.Entries[:pos], idx.Entries[pos+1:]...)
-	return true
+	idx.Entries = filtered
+	return found
 }
 
 func (idx *Index) Sort() {
 	sort.Slice(idx.Entries, func(i, j int) bool {
-		return idx.Entries[i].Path < idx.Entries[j].Path
+		if idx.Entries[i].Path != idx.Entries[j].Path {
+			return idx.Entries[i].Path < idx.Entries[j].Path
+		}
+		stageI := (idx.Entries[i].Flags >> 12) & 0x3
+		stageJ := (idx.Entries[j].Flags >> 12) & 0x3
+		return stageI < stageJ
 	})
 }
 

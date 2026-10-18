@@ -221,10 +221,14 @@ func BuildHunks(edits []Edit, contextLines int) []Hunk {
 			}
 		}
 
-		if oldStart == 0 {
+		if oldCount == 0 {
+			oldStart = 0
+		} else if oldStart == 0 {
 			oldStart = 1
 		}
-		if newStart == 0 {
+		if newCount == 0 {
+			newStart = 0
+		} else if newStart == 0 {
 			newStart = 1
 		}
 
@@ -249,11 +253,30 @@ func FormatUnifiedDiff(pathA, pathB string, edits []Edit, contextLines int) stri
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("--- a/%s\n", pathA))
-	sb.WriteString(fmt.Sprintf("+++ b/%s\n", pathB))
+	if pathA == "/dev/null" || pathA == "" {
+		sb.WriteString("--- /dev/null\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("--- a/%s\n", pathA))
+	}
+	if pathB == "/dev/null" || pathB == "" {
+		sb.WriteString("+++ /dev/null\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("+++ b/%s\n", pathB))
+	}
 
 	for _, hunk := range hunks {
-		sb.WriteString(fmt.Sprintf("@@ -%d,%d +%d,%d @@\n", hunk.OldStart, hunk.OldCount, hunk.NewStart, hunk.NewCount))
+		var oldPart, newPart string
+		if hunk.OldCount == 1 {
+			oldPart = fmt.Sprintf("-%d", hunk.OldStart)
+		} else {
+			oldPart = fmt.Sprintf("-%d,%d", hunk.OldStart, hunk.OldCount)
+		}
+		if hunk.NewCount == 1 {
+			newPart = fmt.Sprintf("+%d", hunk.NewStart)
+		} else {
+			newPart = fmt.Sprintf("+%d,%d", hunk.NewStart, hunk.NewCount)
+		}
+		sb.WriteString(fmt.Sprintf("@@ %s %s @@\n", oldPart, newPart))
 		for _, line := range hunk.Lines {
 			switch line.Op {
 			case OpEqual:
@@ -272,10 +295,10 @@ func FormatUnifiedDiff(pathA, pathB string, edits []Edit, contextLines int) stri
 func DiffStrings(pathA, pathB, a, b string) string {
 	var linesA, linesB []string
 	if len(a) > 0 {
-		linesA = strings.Split(strings.TrimRight(a, "\n"), "\n")
+		linesA = strings.Split(strings.TrimSuffix(a, "\n"), "\n")
 	}
 	if len(b) > 0 {
-		linesB = strings.Split(strings.TrimRight(b, "\n"), "\n")
+		linesB = strings.Split(strings.TrimSuffix(b, "\n"), "\n")
 	}
 	edits := MyersDiff(linesA, linesB)
 	return FormatUnifiedDiff(pathA, pathB, edits, 3)

@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"minigit/pkg/pack"
 )
 
 const (
@@ -36,11 +38,11 @@ type Tree struct {
 func (t *Tree) Sort() {
 	sort.Slice(t.Entries, func(i, j int) bool {
 		nameI := t.Entries[i].Name
-		if t.Entries[i].Mode == "40000" {
+		if t.Entries[i].Mode == "40000" || t.Entries[i].Mode == "040000" {
 			nameI += "/"
 		}
 		nameJ := t.Entries[j].Name
-		if t.Entries[j].Mode == "40000" {
+		if t.Entries[j].Mode == "40000" || t.Entries[j].Mode == "040000" {
 			nameJ += "/"
 		}
 		return nameI < nameJ
@@ -263,6 +265,10 @@ func ReadObject(gitDir string, hashPrefix string) (string, []byte, string, error
 	objPath := filepath.Join(gitDir, "objects", fullHash[:2], fullHash[2:])
 	f, err := os.Open(objPath)
 	if err != nil {
+		typeName, content, packErr := pack.ReadObjectFromPacks(gitDir, fullHash)
+		if packErr == nil {
+			return typeName, content, fullHash, nil
+		}
 		return "", nil, "", err
 	}
 	defer f.Close()
@@ -295,37 +301,44 @@ func ReadObject(gitDir string, hashPrefix string) (string, []byte, string, error
 }
 
 func ResolveObjectHash(gitDir string, prefix string) (string, error) {
+	if len(prefix) < 4 {
+		return "", fmt.Errorf("prefix %s is too short", prefix)
+	}
+
+	matchMap := make(map[string]bool)
+
 	if len(prefix) == 40 {
 		objPath := filepath.Join(gitDir, "objects", prefix[:2], prefix[2:])
 		if _, err := os.Stat(objPath); err == nil {
 			return prefix, nil
 		}
-		return "", fmt.Errorf("object %s not found", prefix)
-	}
-
-	if len(prefix) < 4 {
-		return "", fmt.Errorf("prefix %s is too short", prefix)
-	}
-
-	objDir := filepath.Join(gitDir, "objects", prefix[:2])
-	entries, err := os.ReadDir(objDir)
-	if err != nil {
-		return "", fmt.Errorf("object with prefix %s not found", prefix)
-	}
-
-	rest := prefix[2:]
-	var matches []string
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), rest) {
-			matches = append(matches, prefix[:2]+entry.Name())
+	} else {
+		objDir := filepath.Join(gitDir, "objects", prefix[:2])
+		entries, err := os.ReadDir(objDir)
+		if err == nil {
+			rest := prefix[2:]
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), rest) {
+					matchMap[prefix[:2]+entry.Name()] = true
+				}
+			}
 		}
 	}
 
-	if len(matches) == 0 {
+	packMatches, _ := pack.FindObjectInPacks(gitDir, prefix)
+	for _, m := range packMatches {
+		matchMap[m.Hash] = true
+	}
+
+	if len(matchMap) == 0 {
 		return "", fmt.Errorf("object with prefix %s not found", prefix)
 	}
-	if len(matches) > 1 {
-		return "", fmt.Errorf("ambiguous object prefix %s (%d matches)", prefix, len(matches))
+	if len(matchMap) > 1 {
+		return "", fmt.Errorf("ambiguous object prefix %s (%d matches)", prefix, len(matchMap))
 	}
-	return matches[0], nil
+
+	for k := range matchMap {
+		return k, nil
+	}
+	return "", fmt.Errorf("object with prefix %s not found", prefix)
 }

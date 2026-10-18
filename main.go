@@ -46,6 +46,8 @@ func main() {
 		err = handleCheckout(args)
 	case "diff":
 		err = handleDiff(args)
+	case "merge":
+		err = handleMerge(args)
 	case "tag":
 		err = handleTag(args)
 	case "help", "-h", "--help":
@@ -78,6 +80,7 @@ func printUsage() {
 	fmt.Println("   branch       List, create, or delete branches")
 	fmt.Println("   checkout     Switch branches or restore working tree files")
 	fmt.Println("   diff         Show changes between commits, commit and working tree, etc")
+	fmt.Println("   merge        Join two or more development histories together")
 	fmt.Println("   tag          Create or list tags")
 }
 
@@ -472,11 +475,12 @@ func handleTag(args []string) error {
 
 	rest := fs.Args()
 	if len(rest) == 0 {
-		entries, err := os.ReadDir(r.GitDir + "/refs/tags")
-		if err == nil {
-			for _, e := range entries {
-				fmt.Println(e.Name())
-			}
+		tags, err := r.ListTags()
+		if err != nil {
+			return err
+		}
+		for _, t := range tags {
+			fmt.Println(t)
 		}
 		return nil
 	}
@@ -503,6 +507,23 @@ func handleTag(args []string) error {
 		return fmt.Errorf("tag '%s' already exists", tagName)
 	}
 	return os.WriteFile(tagPath, []byte(headHash+"\n"), 0644)
+}
+
+func handleMerge(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: minigit merge <branch-or-commit>")
+	}
+	r, err := repo.FindRepo(".")
+	if err != nil {
+		return err
+	}
+	target := args[0]
+	msg, err := r.Merge(target)
+	if err != nil {
+		return err
+	}
+	fmt.Println(msg)
+	return nil
 }
 
 func parseOffset(s string) int {

@@ -119,3 +119,28 @@ func TestBuildTree(t *testing.T) {
 		t.Fatalf("expected 40 char tree hash, got %s", rootTreeHash)
 	}
 }
+
+func TestIndexStageSortingAndRemoval(t *testing.T) {
+	idx := &Index{}
+	sha := sha1.Sum([]byte("blob 1\x00x"))
+	idx.AddOrUpdate(IndexEntry{Path: "conflict.txt", Flags: 2 << 12, Sha1: sha})
+	idx.AddOrUpdate(IndexEntry{Path: "conflict.txt", Flags: 1 << 12, Sha1: sha})
+	idx.AddOrUpdate(IndexEntry{Path: "conflict.txt", Flags: 3 << 12, Sha1: sha})
+
+	if len(idx.Entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(idx.Entries))
+	}
+	if (idx.Entries[0].Flags>>12)&3 != 1 || (idx.Entries[1].Flags>>12)&3 != 2 || (idx.Entries[2].Flags>>12)&3 != 3 {
+		t.Fatalf("expected stages 1, 2, 3 sorted, got %d, %d, %d",
+			(idx.Entries[0].Flags>>12)&3, (idx.Entries[1].Flags>>12)&3, (idx.Entries[2].Flags>>12)&3)
+	}
+
+	idx.AddOrUpdate(IndexEntry{Path: "conflict.txt", Flags: 0, Sha1: sha})
+	if len(idx.Entries) != 1 {
+		t.Fatalf("expected 1 entry after stage 0 resolution, got %d", len(idx.Entries))
+	}
+	if (idx.Entries[0].Flags>>12)&3 != 0 {
+		t.Fatalf("expected stage 0, got %d", (idx.Entries[0].Flags>>12)&3)
+	}
+}
+

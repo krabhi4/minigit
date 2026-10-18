@@ -63,3 +63,37 @@ func TestDiffStringsUnified(t *testing.T) {
 		t.Fatalf("missing inserted line epsilon: %s", diffText)
 	}
 }
+
+func TestDiffStringsNewFileAndDeletedFile(t *testing.T) {
+	newDiff := DiffStrings("/dev/null", "new.txt", "", "hello\nworld\n")
+	if !strings.Contains(newDiff, "--- /dev/null") {
+		t.Fatalf("expected /dev/null header, got %s", newDiff)
+	}
+	if !strings.Contains(newDiff, "+++ b/new.txt") {
+		t.Fatalf("expected b/new.txt header, got %s", newDiff)
+	}
+	if !strings.Contains(newDiff, "@@ -0,0 +1,2 @@") {
+		t.Fatalf("expected hunk @@ -0,0 +1,2 @@, got %s", newDiff)
+	}
+
+	delDiff := DiffStrings("old.txt", "/dev/null", "single line\n", "")
+	if !strings.Contains(delDiff, "--- a/old.txt") {
+		t.Fatalf("expected a/old.txt header, got %s", delDiff)
+	}
+	if !strings.Contains(delDiff, "+++ /dev/null") {
+		t.Fatalf("expected /dev/null header, got %s", delDiff)
+	}
+	if !strings.Contains(delDiff, "@@ -1 +0,0 @@") {
+		t.Fatalf("expected hunk @@ -1 +0,0 @@, got %s", delDiff)
+	}
+}
+
+func TestDiffStringsTrailingNewlines(t *testing.T) {
+	oldContent := "foo\n\n\n"
+	newContent := "foo\n"
+	diffText := DiffStrings("t.txt", "t.txt", oldContent, newContent)
+	if !strings.Contains(diffText, "-") {
+		t.Fatalf("expected deleted empty lines to be detected, got %q", diffText)
+	}
+}
+
