@@ -1,7 +1,7 @@
 # minigit
 
 [![CI](https://github.com/krabhi4/minigit/actions/workflows/ci.yml/badge.svg)](https://github.com/krabhi4/minigit/actions/workflows/ci.yml)
-[![Go Version](https://img.shields.io/badge/go-%3E%3D1.22-00ADD8?logo=go)](https://go.dev)
+[![Go Version](https://img.shields.io/badge/go-%3E%3D1.27.3-00ADD8?logo=go)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](go.mod)
 [![Git fsck](https://img.shields.io/badge/git%20fsck---full-passing-success.svg)](test/integration_test.go)
@@ -78,7 +78,7 @@ minigit/
 ## Installation & Quick Start
 
 ### Prerequisites
-- Go `1.22` or later
+- Go `1.27.3` or later
 - Official `git` binary (optional, for running cross-compatibility verification tests)
 
 ### Build from Source

@@ -16,7 +16,7 @@ Please read this document before submitting issues or pull requests to understan
 
 ## Development Prerequisites
 
-- **Go**: Version `1.22` or later.
+- **Go**: Version `1.27.3` or later.
 - **Git**: Official Git CLI (`git` version 2.30+), used by the integration test suite to verify cross-compatibility and run `git fsck`.
 - **Make / Bash**: For local automation (macOS, Linux, or WSL).
 
